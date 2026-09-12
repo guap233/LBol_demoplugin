@@ -1,8 +1,9 @@
-﻿namespace NetworkPlugin.Network.Server.Core;
+namespace NetworkPlugin.Network.Server.Core;
 
 public sealed class ServerOptions
 {
         public int Port { get; set; }
+        public string ListenAddress { get; set; } = "0.0.0.0";
         public int MaxConnections { get; set; } = 32;
         public string ConnectionKey { get; set; } = string.Empty;
 

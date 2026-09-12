@@ -11,6 +11,7 @@ using NetworkPlugin.Network.Room;
 using NetworkPlugin.Utils;
 using NetworkPlugin.Network.Server.Core;
 using NetworkPlugin.Network.Utils;
+using NetworkPlugin.Network.Security;
 
 namespace NetworkPlugin.Network.Server;
 
@@ -48,6 +49,32 @@ public class RelayServer : BaseGameServer
         _configManager = configManager;
     }
 
+    internal RelayServer(ILogger<RelayServer> logger, IServiceProvider serviceProvider, ConfigManager configManager, IServerCore core)
+        : base(core)
+    {
+        _logger = logger;
+        _configManager = configManager;
+    }
+
+    internal void AddSessionForTest(NetPeer peer, PlayerSession session)
+    {
+        lock (_lock)
+        {
+            SessionsByPeer[peer] = session;
+            SessionsByPlayerId[session.PlayerId] = session;
+        }
+    }
+
+    internal Dictionary<string, NetworkRoom> GetRoomsForTest() => _rooms;
+    internal Dictionary<string, NetworkConnection> GetConnectionsForTest() => _connectionsByPlayerId;
+    internal void AddPeerMappingForTest(NetPeer peer, PlayerSession session)
+    {
+        lock (_lock)
+        {
+            SessionsByPeer[peer] = session;
+        }
+    }
+
     #endregion
 
     #region 生命周期
@@ -62,12 +89,10 @@ public class RelayServer : BaseGameServer
         public override void Stop()
     {
         _logger.LogInformation("[RelayServer] Stopping server...");
-
         _core.Stop();
 
         lock (_lock)
         {
-
             _connectionsByPlayerId.Clear();
             _sessionsByPlayerId.Clear();
             _sessionsByPeer.Clear();
@@ -82,7 +107,7 @@ public class RelayServer : BaseGameServer
 
     #region 消息路由与房间协议（Relay）
 
-        private void ProcessMessage(NetPeer fromPeer, NetworkMessage message, DeliveryMethod deliveryMethod)
+    internal void ProcessMessage(NetPeer fromPeer, NetworkMessage message, DeliveryMethod deliveryMethod)
     {
         lock (_lock)
         {
@@ -215,8 +240,18 @@ public class RelayServer : BaseGameServer
 
         private void HandleGetRoomList(NetPeer peer)
     {
+        List<RoomStatus> rooms = _rooms.Values.Select(r =>
+        {
+            var status = r.GetStatus();
+            if (r.Config != null && !r.Config.IsPublic)
+            {
+                // Mask sensitive member details for private rooms
+                status.PlayerIds = new List<string>();
+                status.HostPlayerId = "[Protected]";
+            }
+            return status;
+        }).ToList();
 
-        List<RoomStatus> rooms = _rooms.Values.Select(r => r.GetStatus()).ToList();
         SendMessageToPeer(peer, new NetworkMessage
         {
             Type = NetworkMessageTypes.RoomList,
@@ -229,9 +264,8 @@ public class RelayServer : BaseGameServer
 
     #region 房间管理
 
-        private void HandleCreateRoom(PlayerSession session, NetworkMessage message)
+    private void HandleCreateRoom(PlayerSession session, NetworkMessage message)
     {
-
         if (!string.IsNullOrEmpty(session.CurrentRoomId))
         {
             HandleLeaveRoom(session);
@@ -244,14 +278,15 @@ public class RelayServer : BaseGameServer
             return;
         }
 
-        RoomConfig roomConfig = message.GetRoomConfigPayload();
-        if (roomConfig != null && relayConfig.MaxPlayersPerRoom > 0)
+        RoomConfig roomConfig = message.GetRoomConfigPayload() ?? RoomConfig.Default();
+        int maxAllowed = relayConfig.MaxPlayersPerRoom > 0 ? relayConfig.MaxPlayersPerRoom : 8;
+        if (roomConfig.MaxPlayers < 1 || roomConfig.MaxPlayers > maxAllowed)
         {
-            roomConfig.MaxPlayers = Math.Min(roomConfig.MaxPlayers, relayConfig.MaxPlayersPerRoom);
+            SendErrorMessage(session.Peer, "CreateRoomFailed", $"MaxPlayers must be between 1 and {maxAllowed}");
+            return;
         }
 
         string roomId = GenerateRoomId();
-
         NetworkRoom room = new(roomId, roomConfig, _logger);
         _rooms[roomId] = room;
 
@@ -264,6 +299,8 @@ public class RelayServer : BaseGameServer
         var joinResult = room.AddPlayer(session.PlayerId, connection);
         if (!joinResult.IsSuccess)
         {
+            // Atomic rollback
+            _rooms.Remove(roomId);
             SendErrorMessage(session.Peer, "CreateRoomFailed", joinResult.ErrorMessage ?? "Unknown error");
             return;
         }
@@ -287,9 +324,8 @@ public class RelayServer : BaseGameServer
         _logger.LogInformation($"[RelayServer] Room created: {roomId} by player {session.PlayerId}");
     }
 
-        private void HandleJoinRoom(PlayerSession session, NetworkMessage message)
+    private void HandleJoinRoom(PlayerSession session, NetworkMessage message)
     {
-
         string roomId = TryGetStringProperty(message.Payload, "RoomId") ?? session.CurrentRoomId;
         if (string.IsNullOrEmpty(roomId))
         {
@@ -307,6 +343,22 @@ public class RelayServer : BaseGameServer
         {
             SendErrorMessage(session.Peer, "JoinRoomFailed", "Room is full");
             return;
+        }
+
+        string password = TryGetStringProperty(message.Payload, "Password");
+        if (!room.Config.IsPublic && string.IsNullOrWhiteSpace(password) && !string.Equals(room.HostPlayerId, session.PlayerId, StringComparison.Ordinal))
+        {
+            SendErrorMessage(session.Peer, "JoinRoomFailed", "Cannot join private room without authorization");
+            return;
+        }
+
+        if (!string.IsNullOrEmpty(room.Config.Password))
+        {
+            if (string.IsNullOrEmpty(password) || !string.Equals(room.Config.Password, password, StringComparison.Ordinal))
+            {
+                SendErrorMessage(session.Peer, "JoinRoomFailed", "Invalid room password");
+                return;
+            }
         }
 
         if (!string.IsNullOrEmpty(session.CurrentRoomId))
@@ -352,6 +404,13 @@ public class RelayServer : BaseGameServer
         {
             room.RemovePlayer(session.PlayerId);
 
+            room.BroadcastMessage(new NetworkMessage
+            {
+                Type = NetworkMessageTypes.PlayerLeft,
+                Payload = new { PlayerId = session.PlayerId },
+                SenderPlayerId = "SERVER"
+            }, excludePlayerId: session.PlayerId);
+
             BroadcastPlayerList(room);
 
             if (room.PlayerCount == 0)
@@ -372,17 +431,19 @@ public class RelayServer : BaseGameServer
 
         private void HandleRoomMessage(PlayerSession session, NetworkMessage message, DeliveryMethod deliveryMethod)
     {
-
-        string roomId = TryGetStringProperty(message.Payload, "RoomId") ?? session.CurrentRoomId;
-        if (string.IsNullOrEmpty(roomId) || !_rooms.TryGetValue(roomId, out var room))
+        if (string.IsNullOrEmpty(session.CurrentRoomId) || !_rooms.TryGetValue(session.CurrentRoomId, out var room))
         {
+            SendErrorMessage(session.Peer, "RoomMessageFailed", "Not in room");
+            return;
+        }
 
+        if (!room.ContainsPlayer(session.PlayerId))
+        {
             SendErrorMessage(session.Peer, "RoomMessageFailed", "Not in room");
             return;
         }
 
         string innerType = TryGetStringProperty(message.Payload, "Type") ?? NetworkMessageTypes.RoomMessage;
-
         object innerPayload = TryGetObjectProperty(message.Payload, "Payload") ?? message.Payload;
 
         room.BroadcastMessage(new NetworkMessage
@@ -393,13 +454,29 @@ public class RelayServer : BaseGameServer
         }, excludePlayerId: session.PlayerId);
     }
 
-        private void HandleDirectMessage(PlayerSession session, NetworkMessage message, DeliveryMethod deliveryMethod)
+    private void HandleDirectMessage(PlayerSession session, NetworkMessage message, DeliveryMethod deliveryMethod)
     {
-
         string targetPlayerId = TryGetStringProperty(message.Payload, "TargetPlayerId");
-
         string innerType = TryGetStringProperty(message.Payload, "Type") ?? NetworkMessageTypes.DirectMessage;
         object innerPayload = TryGetObjectProperty(message.Payload, "Payload") ?? message.Payload;
+
+        if (string.IsNullOrEmpty(session.CurrentRoomId) || !_rooms.TryGetValue(session.CurrentRoomId, out var room) || !room.ContainsPlayer(session.PlayerId))
+        {
+            SendErrorMessage(session.Peer, "DirectMessageFailed", "Sender not in room");
+            return;
+        }
+
+        if (string.IsNullOrEmpty(targetPlayerId) || !room.ContainsPlayer(targetPlayerId) || !_connectionsByPlayerId.TryGetValue(targetPlayerId, out var connection))
+        {
+            SendErrorMessage(session.Peer, "DirectMessageFailed", "Target not in same room");
+            return;
+        }
+
+        if (!NetworkMessagePolicy.IsRegistered(innerType))
+        {
+            SendErrorMessage(session.Peer, "DirectMessageFailed", $"Unregistered inner message type: {innerType}");
+            return;
+        }
 
         if (string.Equals(innerType, NetworkMessageTypes.FullStateSyncRequest, StringComparison.Ordinal))
         {
@@ -423,13 +500,6 @@ public class RelayServer : BaseGameServer
             return;
         }
 
-        if (string.IsNullOrEmpty(targetPlayerId) || !_connectionsByPlayerId.TryGetValue(targetPlayerId, out var connection))
-        {
-
-            SendErrorMessage(session.Peer, "DirectMessageFailed", "Target not found");
-            return;
-        }
-
         connection.SendMessage(new NetworkMessage
         {
             Type = innerType,
@@ -438,9 +508,8 @@ public class RelayServer : BaseGameServer
         }, deliveryMethod);
     }
 
-        private void HandleKickPlayer(PlayerSession session, NetworkMessage message)
+    private void HandleKickPlayer(PlayerSession session, NetworkMessage message)
     {
-
         if (string.IsNullOrEmpty(session.CurrentRoomId) || !_rooms.TryGetValue(session.CurrentRoomId, out var room))
         {
             SendErrorMessage(session.Peer, "KickPlayerFailed", "Not in room");
@@ -461,6 +530,24 @@ public class RelayServer : BaseGameServer
         }
 
         room.RemovePlayer(targetPlayerId);
+
+        // Atomic cleanup of kicked player's room session and connection
+        if (_sessionsByPlayerId.TryGetValue(targetPlayerId, out var targetSession))
+        {
+            targetSession.CurrentRoomId = string.Empty;
+        }
+
+        if (_connectionsByPlayerId.TryGetValue(targetPlayerId, out var targetConnection))
+        {
+            targetConnection.CurrentRoomId = string.Empty;
+            SendMessageToPeer(targetConnection.Peer, new NetworkMessage
+            {
+                Type = NetworkMessageTypes.KickPlayer,
+                Payload = new { Reason = "KickedByHost", RoomId = room.RoomId },
+                SenderPlayerId = "SERVER"
+            }, DeliveryMethod.ReliableOrdered);
+        }
+
         BroadcastPlayerList(room);
     }
 
@@ -478,42 +565,45 @@ public class RelayServer : BaseGameServer
     {
         try
         {
-
-            ReconnectRequest request = JsonSerializer.Deserialize<ReconnectRequest>(message.Payload?.ToString() ?? string.Empty);
-            if (request == null || string.IsNullOrWhiteSpace(request.PlayerId) || string.IsNullOrWhiteSpace(request.ReconnectToken))
+            string playerId = TryGetStringProperty(message.Payload, "PlayerId");
+            string reconnectToken = TryGetStringProperty(message.Payload, "ReconnectToken");
+            if (string.IsNullOrWhiteSpace(playerId) || string.IsNullOrWhiteSpace(reconnectToken))
             {
-
                 SendMessageToPeer(fromPeer, new NetworkMessage { Type = NetworkMessageTypes.Reconnect_RESPONSE, Payload = new { Success = false, Error = "Invalid request" }, SenderPlayerId = "SERVER" }, DeliveryMethod.ReliableOrdered);
                 return;
             }
 
             lock (_lock)
             {
-
-                if (!_sessionsByPlayerId.TryGetValue(request.PlayerId, out var session))
+                if (!_sessionsByPlayerId.TryGetValue(playerId, out var session))
                 {
                     SendMessageToPeer(fromPeer, new NetworkMessage { Type = NetworkMessageTypes.Reconnect_RESPONSE, Payload = new { Success = false, Error = "Unknown playerId" }, SenderPlayerId = "SERVER" }, DeliveryMethod.ReliableOrdered);
                     return;
                 }
 
-                if (session.IsConnected)
+                if (session.IsConnected && session.Peer == fromPeer)
                 {
                     SendMessageToPeer(fromPeer, new NetworkMessage { Type = NetworkMessageTypes.Reconnect_RESPONSE, Payload = new { Success = false, Error = "Already connected" }, SenderPlayerId = "SERVER" }, DeliveryMethod.ReliableOrdered);
                     return;
                 }
 
                 string expectedToken = TryGetMetadataString(session.Metadata, "ReconnectToken");
-                if (!string.Equals(expectedToken, request.ReconnectToken, StringComparison.Ordinal))
+                if (!string.Equals(expectedToken, reconnectToken, StringComparison.Ordinal))
                 {
                     SendMessageToPeer(fromPeer, new NetworkMessage { Type = NetworkMessageTypes.Reconnect_RESPONSE, Payload = new { Success = false, Error = "Invalid token" }, SenderPlayerId = "SERVER" }, DeliveryMethod.ReliableOrdered);
                     return;
                 }
 
-                if (_disconnectedAtByPlayerId.TryGetValue(request.PlayerId, out var disconnectedAt) &&
+                if (_disconnectedAtByPlayerId.TryGetValue(playerId, out var disconnectedAt) &&
                     DateTime.UtcNow - disconnectedAt > _reconnectGracePeriod)
                 {
                     SendMessageToPeer(fromPeer, new NetworkMessage { Type = NetworkMessageTypes.Reconnect_RESPONSE, Payload = new { Success = false, Error = "Reconnect window expired" }, SenderPlayerId = "SERVER" }, DeliveryMethod.ReliableOrdered);
                     return;
+                }
+
+                if (session.Peer != null && session.Peer != fromPeer)
+                {
+                    _sessionsByPeer.Remove(session.Peer);
                 }
 
                 session.Peer = fromPeer;
@@ -523,9 +613,22 @@ public class RelayServer : BaseGameServer
 
                 _sessionsByPeer[fromPeer] = session;
 
-                _connectionsByPlayerId[session.PlayerId] = new NetworkConnection(fromPeer, session.PlayerId, session.CurrentRoomId);
+                var conn = new NetworkConnection(fromPeer, session.PlayerId, session.CurrentRoomId);
+                _connectionsByPlayerId[session.PlayerId] = conn;
+
+                if (!string.IsNullOrEmpty(session.CurrentRoomId) && _rooms.TryGetValue(session.CurrentRoomId, out var room))
+                {
+                    if (!room.ContainsPlayer(session.PlayerId))
+                    {
+                        room.AddPlayer(session.PlayerId, conn);
+                    }
+                    BroadcastPlayerList(room);
+                }
 
                 _disconnectedAtByPlayerId.Remove(session.PlayerId);
+
+                string newToken = GenerateReconnectToken();
+                session.Metadata["ReconnectToken"] = newToken;
 
                 SendMessageToPeer(fromPeer, new NetworkMessage
                 {
@@ -535,7 +638,8 @@ public class RelayServer : BaseGameServer
                         Success = true,
                         PlayerId = session.PlayerId,
                         PlayerName = session.PlayerName,
-                        CurrentRoomId = session.CurrentRoomId
+                        CurrentRoomId = session.CurrentRoomId,
+                        ReconnectToken = newToken
                     },
                     SenderPlayerId = "SERVER"
                 }, DeliveryMethod.ReliableOrdered);
@@ -585,6 +689,18 @@ public class RelayServer : BaseGameServer
             if (string.IsNullOrWhiteSpace(targetPlayerId))
             {
                 SendMessageToPeer(session.Peer, new NetworkMessage { Type = NetworkMessageTypes.NatError, Payload = new { Error = "Missing TargetPlayerId" }, SenderPlayerId = "SERVER" }, DeliveryMethod.ReliableOrdered);
+                return;
+            }
+
+            if (string.IsNullOrEmpty(session.CurrentRoomId) || !_rooms.TryGetValue(session.CurrentRoomId, out var room) || !room.ContainsPlayer(session.PlayerId))
+            {
+                SendMessageToPeer(session.Peer, new NetworkMessage { Type = NetworkMessageTypes.NatError, Payload = new { Error = "Sender not in room" }, SenderPlayerId = "SERVER" }, DeliveryMethod.ReliableOrdered);
+                return;
+            }
+
+            if (!room.ContainsPlayer(targetPlayerId))
+            {
+                SendMessageToPeer(session.Peer, new NetworkMessage { Type = NetworkMessageTypes.NatError, Payload = new { Error = "Target not in same room" }, SenderPlayerId = "SERVER" }, DeliveryMethod.ReliableOrdered);
                 return;
             }
 
@@ -812,8 +928,11 @@ public class RelayServer : BaseGameServer
 
     #region 消息发送与协议辅助
 
-        private void SendMessageToPeer(NetPeer peer, NetworkMessage message, DeliveryMethod deliveryMethod)
+    internal Action<NetPeer, NetworkMessage, DeliveryMethod>? MessageSentForTest { get; set; }
+
+    private void SendMessageToPeer(NetPeer peer, NetworkMessage message, DeliveryMethod deliveryMethod)
     {
+        MessageSentForTest?.Invoke(peer, message, deliveryMethod);
         try
         {
             NetDataWriter writer = new();
@@ -865,6 +984,14 @@ public class RelayServer : BaseGameServer
             return;
         }
 
+        string requesterId = TryGetStringProperty(message.Payload, "RequesterId") ?? TryGetStringProperty(message.Payload, "TargetPlayerId");
+        if (!string.IsNullOrWhiteSpace(requesterId) && !string.Equals(requesterId, session.PlayerId, StringComparison.Ordinal))
+        {
+            _logger?.LogWarning($"[RelayServer] 客户端 {session.PlayerId} 企图在 RoomStateRequest 中冒充 {requesterId}，已拒绝");
+            SendErrorMessage(session.Peer, "RoomStateRequestFailed", "Requester identity mismatch");
+            return;
+        }
+
         string hostPlayerId = room.HostPlayerId;
         if (string.IsNullOrWhiteSpace(hostPlayerId) || !_connectionsByPlayerId.TryGetValue(hostPlayerId, out var hostConnection))
         {
@@ -894,6 +1021,14 @@ public class RelayServer : BaseGameServer
         if (!string.Equals(session.CurrentRoomId, roomId, StringComparison.Ordinal) || !room.ContainsPlayer(session.PlayerId))
         {
             SendErrorMessage(session.Peer, "RoomStateUploadFailed", "Not in room");
+            return;
+        }
+
+        string uploaderId = TryGetStringProperty(message.Payload, "UploaderId") ?? TryGetStringProperty(message.Payload, "OwnerPlayerId");
+        if (!string.IsNullOrWhiteSpace(uploaderId) && !string.Equals(uploaderId, session.PlayerId, StringComparison.Ordinal))
+        {
+            _logger?.LogWarning($"[RelayServer] 客户端 {session.PlayerId} 企图在 RoomStateUpload 中冒充 {uploaderId}，已拒绝");
+            SendErrorMessage(session.Peer, "RoomStateUploadFailed", "Uploader identity mismatch");
             return;
         }
 
@@ -1223,6 +1358,7 @@ public class RelayServer : BaseGameServer
             {
                 PlayerId = session.PlayerId,
                 ReconnectToken = TryGetMetadataString(session.Metadata, "ReconnectToken"),
+                SessionNonce = session.SessionNonce,
                 ServerTime = DateTime.UtcNow.Ticks
             },
             SenderPlayerId = "SERVER"

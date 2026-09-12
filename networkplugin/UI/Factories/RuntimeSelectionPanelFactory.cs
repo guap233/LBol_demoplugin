@@ -1,6 +1,7 @@
-﻿using System;
+using System;
 using System.Reflection;
 using HarmonyLib;
+using LBoL.Presentation.UI;
 using LBoL.Presentation.UI.Dialogs;
 using LBoL.Presentation.UI.Widgets;
 using TMPro;
@@ -184,6 +185,24 @@ internal static class RuntimeSelectionPanelFactory
             CommonButtonWidget confirmWidget = TryResolveCommonButtonWidget(confirm ?? singleConfirm ?? cancel);
             CommonButtonWidget cancelWidget = TryResolveCommonButtonWidget(cancel ?? confirm ?? singleConfirm);
 
+            // 彻底销毁所有原生对话框控制组件及输入处理器，阻断其生命周期与输入栈行为
+            // 防止首次激活时触发 MessageDialog.Awake 注册原生 OnConfirm/OnCancel 回调，
+            // 进而防止点击时调用 MessageDialog.Hide -> OnHiding -> UiManager.PopActionHandler 损坏输入栈
+            var dialogComponents = frame.GetComponentsInChildren<UiDialogBase>(true);
+            foreach (var d in dialogComponents)
+            {
+                UnityEngine.Object.DestroyImmediate(d);
+            }
+
+            var actionHandlers = frame.GetComponentsInChildren<IInputActionHandler>(true);
+            foreach (var h in actionHandlers)
+            {
+                if (h is Component c)
+                {
+                    UnityEngine.Object.DestroyImmediate(c);
+                }
+            }
+
             RectTransform panelRect;
             {
                 RectTransform __a = mainText?.rectTransform;
@@ -263,8 +282,6 @@ internal static class RuntimeSelectionPanelFactory
                 UnityEngine.Object.Destroy(root);
                 return null;
             }
-
-            dialog.enabled = false;
 
             if (cancel != null)
             {

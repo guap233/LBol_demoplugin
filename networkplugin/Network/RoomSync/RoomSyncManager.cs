@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Text.Json;
 using BepInEx.Logging;
@@ -23,6 +23,9 @@ public class RoomSyncManager
     private readonly Dictionary<string, RoomStateSnapshot> _hostRoomStates = new(StringComparer.Ordinal);
 
     private readonly Dictionary<string, RoomStateSnapshot> _clientRoomStates = new(StringComparer.Ordinal);
+
+    public const int MaxRoomSnapshotPayloadSize = 64 * 1024;
+    public const int MaxSnapshotArrayLength = 100;
 
     private (string roomKey, int act, int x, int y, string stationType, long atUtcTicks)? _lastEntered;
 
@@ -79,9 +82,9 @@ public class RoomSyncManager
             string key = BuildRoomKey(act, x, y, stationType ?? string.Empty);
             _lastEntered = (key, act, x, y, stationType ?? string.Empty, DateTime.UtcNow.Ticks);
         }
-        catch
+        catch (Exception ex)
         {
-
+            Plugin.Logger?.LogDebug($"[RoomSyncManager] SetLastEnteredNode error: {ex.Message}");
         }
     }
 
@@ -100,6 +103,19 @@ public class RoomSyncManager
         lock (_lock)
         {
             return _clientRoomStates.TryGetValue(roomKey, out var s) ? s : null;
+        }
+    }
+
+    public RoomStateSnapshot TryGetHostRoomState(string roomKey)
+    {
+        if (string.IsNullOrWhiteSpace(roomKey))
+        {
+            return null;
+        }
+
+        lock (_lock)
+        {
+            return _hostRoomStates.TryGetValue(roomKey, out var s) ? s : null;
         }
     }
 
@@ -289,9 +305,14 @@ public class RoomSyncManager
 
     private void HandleRoomStateUpload(JsonElement root)
     {
-
         if (!NetworkIdentityTracker.GetSelfIsHost())
         {
+            return;
+        }
+
+        if (root.ValueKind == JsonValueKind.Object && root.GetRawText().Length > MaxRoomSnapshotPayloadSize)
+        {
+            _logger?.LogWarning($"[RoomSyncManager] 拦截过大的房间上传快照负载: {root.GetRawText().Length} > {MaxRoomSnapshotPayloadSize}");
             return;
         }
 
@@ -324,7 +345,7 @@ public class RoomSyncManager
             BattleId = TryGetString(root, "BattleId") ?? string.Empty,
             Rewards = TryDeserialize<BattleRewardSnapshot>(root, "Rewards") ?? new BattleRewardSnapshot(),
             Enemies = TryDeserializeEnemies(root) ?? new List<EnemyStateSnapshot>(),
-            GapOptionsEvents = TryDeserialize<List<GapOptionsEventSnapshot>>(root, "GapOptionsEvents") ?? GapOptionsSyncPatch.GetRecentGapOptionsEvents(roomKey),
+            GapOptionsEvents = TryDeserializeGapEvents(root) ?? GapOptionsSyncPatch.GetRecentGapOptionsEvents(roomKey),
         };
 
         RoomStateSnapshot stored;
@@ -332,7 +353,6 @@ public class RoomSyncManager
         {
             if (_hostRoomStates.TryGetValue(roomKey, out stored!))
             {
-
                 if (string.IsNullOrWhiteSpace(stored.OwnerPlayerId))
                 {
                     stored.OwnerPlayerId = uploaderId;
@@ -340,6 +360,13 @@ public class RoomSyncManager
 
                 if (!string.Equals(stored.OwnerPlayerId, uploaderId, StringComparison.Ordinal))
                 {
+                    _logger?.LogWarning($"[RoomSyncManager] 拒绝非所有者上传房间快照: room={roomKey}, owner={stored.OwnerPlayerId}, uploader={uploaderId}");
+                    return;
+                }
+
+                if (incoming.RoomVersion > 0 && incoming.RoomVersion < stored.RoomVersion)
+                {
+                    _logger?.LogWarning($"[RoomSyncManager] 忽略陈旧的房间上传版本: room={roomKey}, incomingVersion={incoming.RoomVersion}, storedVersion={stored.RoomVersion}");
                     return;
                 }
 
@@ -362,11 +389,16 @@ public class RoomSyncManager
                 stored = incoming;
             }
         }
-
     }
 
     private void HandleRoomStateResponse(JsonElement root)
     {
+        if (root.ValueKind == JsonValueKind.Object && root.GetRawText().Length > MaxRoomSnapshotPayloadSize)
+        {
+            _logger?.LogWarning($"[RoomSyncManager] 拦截过大的房间响应快照负载: {root.GetRawText().Length} > {MaxRoomSnapshotPayloadSize}");
+            return;
+        }
+
         string roomKey = TryGetString(root, "RoomKey");
         if (string.IsNullOrWhiteSpace(roomKey))
         {
@@ -394,11 +426,20 @@ public class RoomSyncManager
             BattleId = TryGetString(root, "BattleId") ?? string.Empty,
             Rewards = TryDeserialize<BattleRewardSnapshot>(root, "Rewards") ?? new BattleRewardSnapshot(),
             Enemies = TryDeserializeEnemies(root) ?? new List<EnemyStateSnapshot>(),
-            GapOptionsEvents = TryDeserialize<List<GapOptionsEventSnapshot>>(root, "GapOptionsEvents") ?? new List<GapOptionsEventSnapshot>(),
+            GapOptionsEvents = TryDeserializeGapEvents(root) ?? new List<GapOptionsEventSnapshot>(),
         };
 
         lock (_lock)
         {
+            if (_clientRoomStates.TryGetValue(roomKey, out var current) && current != null)
+            {
+                if (snapshot.RoomVersion <= current.RoomVersion)
+                {
+                    _logger?.LogDebug($"[RoomSyncManager] 客户端忽略陈旧或重复的快照: room={roomKey}, incomingVersion={snapshot.RoomVersion}, currentVersion={current.RoomVersion}");
+                    return;
+                }
+            }
+
             _clientRoomStates[roomKey] = snapshot;
         }
 
@@ -460,7 +501,36 @@ public class RoomSyncManager
                 return null;
             }
 
+            if (enemiesEl.GetArrayLength() > MaxSnapshotArrayLength)
+            {
+                Plugin.Logger?.LogWarning($"[RoomSyncManager] 拦截超限敌人数组长度: {enemiesEl.GetArrayLength()} > {MaxSnapshotArrayLength}");
+                return null;
+            }
+
             return JsonSerializer.Deserialize<List<EnemyStateSnapshot>>(enemiesEl.GetRawText());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static List<GapOptionsEventSnapshot> TryDeserializeGapEvents(JsonElement root)
+    {
+        try
+        {
+            if (!root.TryGetProperty("GapOptionsEvents", out var gapEl) || gapEl.ValueKind != JsonValueKind.Array)
+            {
+                return null;
+            }
+
+            if (gapEl.GetArrayLength() > MaxSnapshotArrayLength)
+            {
+                Plugin.Logger?.LogWarning($"[RoomSyncManager] 拦截超限隙间事件数组长度: {gapEl.GetArrayLength()} > {MaxSnapshotArrayLength}");
+                return null;
+            }
+
+            return JsonSerializer.Deserialize<List<GapOptionsEventSnapshot>>(gapEl.GetRawText());
         }
         catch
         {
@@ -486,26 +556,7 @@ public class RoomSyncManager
     }
 
     private static bool TryGetJsonElement(object payload, out JsonElement root)
-    {
-        if (payload is JsonElement je)
-        {
-            root = je;
-            return true;
-        }
-
-        try
-        {
-            string json = JsonCompat.Serialize(payload);
-            using JsonDocument doc = JsonDocument.Parse(json);
-            root = doc.RootElement.Clone();
-            return true;
-        }
-        catch
-        {
-            root = default;
-            return false;
-        }
-    }
+        => NetworkEventHelper.TryGetJsonElement(payload, out root);
 
     private static string TryGetString(JsonElement root, string property)
     {

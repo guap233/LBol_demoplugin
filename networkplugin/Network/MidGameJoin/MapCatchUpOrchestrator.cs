@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using BepInEx.Logging;
@@ -15,6 +15,7 @@ using NetworkPlugin.Network.Client;
 using NetworkPlugin.Network.RoomSync;
 using NetworkPlugin.Network.Services;
 using NetworkPlugin.Network.Snapshot;
+using NetworkPlugin.Patch.UI;
 using NetworkPlugin.Utils;
 
 namespace NetworkPlugin.Network.MidGameJoin;
@@ -170,6 +171,7 @@ public sealed class MapCatchUpOrchestrator
             }
 
             _startGamePrompted = true;
+            MainMenuMultiplayerEntryPatch.HideRoomListOverlay(immediate: true);
 
             StartGameData data = new StartGameData
             {

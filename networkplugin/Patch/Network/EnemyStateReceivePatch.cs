@@ -53,18 +53,27 @@ public static class EnemyStateReceivePatch
     private static bool IsSelfHost()
         => NetworkIdentityTracker.GetSelfIsHost();
 
-    private sealed class PendingState
+    internal sealed class PendingState
     {
-        public long Timestamp;
         public string BattleId;
         public int RootIndex;
         public string EnemyId;
         public string SpawnId;
+
+        // Vitals field group
+        public long VitalsTimestamp;
+        public long LastAppliedVitalsTimestamp;
+        public bool HasVitalsUpdate;
         public int CurrentHp;
         public int Block;
         public int Shield;
         public bool IsAlive;
         public bool IsDying;
+
+        // Status effects field group
+        public long StatusTimestamp;
+        public long LastAppliedStatusTimestamp;
+        public bool HasStatusUpdate;
         public List<RemoteStatusEffectInfo> StatusEffects;
     }
 
@@ -141,6 +150,26 @@ public static class EnemyStateReceivePatch
         }
     }
 
+    internal static void EnsureSubscribedForTest(INetworkClient client) => EnsureSubscribed(client);
+    internal static int GetPendingCountForTest()
+    {
+        lock (_lock) return _pendingByEnemyKey.Count;
+    }
+    internal static PendingState GetPendingStateForTest(string key)
+    {
+        lock (_lock) return _pendingByEnemyKey.TryGetValue(key, out var s) ? s : null;
+    }
+    internal static void ClearPendingForTest()
+    {
+        lock (_lock)
+        {
+            _pendingByEnemyKey.Clear();
+            _killedEnemiesInBattle.Clear();
+        }
+    }
+    internal static void OnGameEventReceivedForTest(string eventType, object payload)
+        => OnGameEventReceived(eventType, payload);
+
     private static void OnConnectionStateChanged(bool connected)
     {
         if (connected)
@@ -162,7 +191,11 @@ public static class EnemyStateReceivePatch
             return;
         }
 
-        Plugin.Logger?.LogInfo($"[EnemyStateReceive] Received event {eventType} (SelfIsHost: {NetworkIdentityTracker.GetSelfIsHost()})");
+        if (NetworkIdentityTracker.GetSelfIsHost())
+        {
+            Plugin.Logger?.LogWarning("[EnemyStateReceive] Host 忽略远端敌人状态同步（Host 拥有权威状态）");
+            return;
+        }
 
         if (!TryGetJsonElement(payload, out JsonElement root))
         {
@@ -185,44 +218,52 @@ public static class EnemyStateReceivePatch
             return;
         }
 
+        bool hasStatusField = false;
         List<RemoteStatusEffectInfo> parsedEffects = null;
         if (root.TryGetProperty("UpdateData", out JsonElement updateDataElem) && updateDataElem.ValueKind == JsonValueKind.Object)
         {
             if ((updateDataElem.TryGetProperty("StatusEffects", out JsonElement seElem) || updateDataElem.TryGetProperty("statusEffects", out seElem)) && seElem.ValueKind == JsonValueKind.Array)
             {
+                hasStatusField = true;
                 parsedEffects = ParseStatusEffects(seElem);
             }
         }
 
-        if (parsedEffects == null && (enemyElem.TryGetProperty("StatusEffects", out JsonElement seElemDirect) || enemyElem.TryGetProperty("statusEffects", out seElemDirect)) && seElemDirect.ValueKind == JsonValueKind.Array)
+        if (!hasStatusField && (enemyElem.TryGetProperty("StatusEffects", out JsonElement seElemDirect) || enemyElem.TryGetProperty("statusEffects", out seElemDirect)) && seElemDirect.ValueKind == JsonValueKind.Array)
         {
+            hasStatusField = true;
             parsedEffects = ParseStatusEffects(seElemDirect);
         }
-
-        PendingState pending = new()
-        {
-            Timestamp = ts,
-            BattleId = battleId,
-            RootIndex = rootIndex,
-            EnemyId = enemyId,
-            SpawnId = spawnId,
-            CurrentHp = TryGetInt(enemyElem, "CurrentHp", out int hp) ? hp : 0,
-            Block = TryGetInt(enemyElem, "Block", out int block) ? block : 0,
-            Shield = TryGetInt(enemyElem, "Shield", out int shield) ? shield : 0,
-            IsAlive = GetBool(enemyElem, "IsAlive"),
-            IsDying = GetBool(enemyElem, "IsDying"),
-            StatusEffects = parsedEffects,
-        };
 
         string spawnKey = BuildSpawnKey(battleId, spawnId, rootIndex, enemyId);
         string legacyKey = BuildLegacyKey(battleId, rootIndex, enemyId);
 
         lock (_lock)
         {
-            UpsertPending(spawnKey, pending);
-            if (!string.Equals(spawnKey, legacyKey, StringComparison.Ordinal))
+            PendingState target = GetOrCreatePending(spawnKey, legacyKey);
+            target.BattleId = battleId;
+            target.RootIndex = rootIndex;
+            if (!string.IsNullOrWhiteSpace(enemyId)) target.EnemyId = enemyId;
+            if (!string.IsNullOrWhiteSpace(spawnId)) target.SpawnId = spawnId;
+
+            // Vitals 字段组合并：若到包时间戳大于等于现有时间戳，则更新血量、格挡、护盾与存活状态
+            if (ts >= target.VitalsTimestamp)
             {
-                UpsertPending(legacyKey, pending);
+                target.VitalsTimestamp = ts;
+                target.HasVitalsUpdate = true;
+                target.CurrentHp = TryGetInt(enemyElem, "CurrentHp", out int hp) ? hp : 0;
+                target.Block = TryGetInt(enemyElem, "Block", out int block) ? block : 0;
+                target.Shield = TryGetInt(enemyElem, "Shield", out int shield) ? shield : 0;
+                target.IsAlive = GetBool(enemyElem, "IsAlive");
+                target.IsDying = GetBool(enemyElem, "IsDying");
+            }
+
+            // StatusEffects 字段组合并：仅在数据包明确携带状态字段且时间戳更新时合并；血量包不带状态时绝不抹除已有状态
+            if (hasStatusField && ts >= target.StatusTimestamp)
+            {
+                target.StatusTimestamp = ts;
+                target.HasStatusUpdate = true;
+                target.StatusEffects = parsedEffects;
             }
         }
 
@@ -285,107 +326,115 @@ public static class EnemyStateReceivePatch
             return;
         }
 
-        int oldHp = enemy.Hp;
-        int oldBlock = enemy.Block;
-        int oldShield = enemy.Shield;
-
-        int newHp = Math.Max(0, pending.CurrentHp);
-        int newBlock = Math.Max(0, pending.Block);
-        int newShield = Math.Max(0, pending.Shield);
-
-        if (!pending.IsAlive || pending.IsDying)
+        // 1. 血量/格挡/护盾更新
+        if (pending.HasVitalsUpdate && pending.VitalsTimestamp > pending.LastAppliedVitalsTimestamp)
         {
-            newHp = 0;
-        }
+            int oldHp = enemy.Hp;
+            int oldBlock = enemy.Block;
+            int oldShield = enemy.Shield;
 
-        Plugin.Logger?.LogInfo($"[EnemyStateReceive] ApplyState: {enemy.Name} Hp: {oldHp}->{newHp}, Block: {oldBlock}->{newBlock}, Shield: {oldShield}->{newShield}");
+            int newHp = Math.Max(0, pending.CurrentHp);
+            int newBlock = Math.Max(0, pending.Block);
+            int newShield = Math.Max(0, pending.Shield);
 
-        using (EnemySyncPatch.EnterApplyRemoteStateScope())
-        {
-            TrySetEnemyProperty(enemy, "Hp", newHp);
-            TrySetEnemyProperty(enemy, "Block", newBlock);
-            TrySetEnemyProperty(enemy, "Shield", newShield);
-        }
-
-        if (newHp == 0)
-        {
-            var battle = enemy.Battle;
-            if (battle != null)
+            if (!pending.IsAlive || pending.IsDying)
             {
-                lock (_lock)
+                newHp = 0;
+            }
+
+            Plugin.Logger?.LogInfo($"[EnemyStateReceive] ApplyState: {enemy.Name} Hp: {oldHp}->{newHp}, Block: {oldBlock}->{newBlock}, Shield: {oldShield}->{newShield}");
+
+            using (EnemySyncPatch.EnterApplyRemoteStateScope())
+            {
+                TrySetEnemyProperty(enemy, "Hp", newHp);
+                TrySetEnemyProperty(enemy, "Block", newBlock);
+                TrySetEnemyProperty(enemy, "Shield", newShield);
+            }
+
+            pending.LastAppliedVitalsTimestamp = pending.VitalsTimestamp;
+
+            if (newHp == 0)
+            {
+                var battle = enemy.Battle;
+                if (battle != null)
                 {
-                    if (_killedEnemiesInBattle.Add(enemy))
+                    lock (_lock)
                     {
-                        Plugin.Logger?.LogInfo($"[EnemyStateReceive] 触发远程斩杀 ForceKillAction: {enemy.Name}");
-                        battle.RequestDebugAction(new ForceKillAction(battle.Player, enemy), "RemoteForceKill");
+                        if (_killedEnemiesInBattle.Add(enemy))
+                        {
+                            Plugin.Logger?.LogInfo($"[EnemyStateReceive] 触发远程斩杀 ForceKillAction: {enemy.Name}");
+                            battle.RequestDebugAction(new ForceKillAction(battle.Player, enemy), "RemoteForceKill");
+                        }
                     }
                 }
+                return;
             }
-            return;
-        }
 
-        try
-        {
-            var view = GameDirector.GetEnemy(enemy);
-            if (view != null)
+            try
             {
-                int hpDamage = oldHp - newHp;
-                int blockDamage = Math.Max(0, oldBlock - newBlock);
-                int shieldDamage = Math.Max(0, oldShield - newShield);
-                int healAmount = newHp - oldHp;
-
-                if (hpDamage > 0 || blockDamage > 0 || shieldDamage > 0)
+                var view = GameDirector.GetEnemy(enemy);
+                if (view != null)
                 {
-                    DamageInfo damageInfo = DamageInfo.Attack(hpDamage);
-                    damageInfo.DamageBlocked = blockDamage;
-                    damageInfo.DamageShielded = shieldDamage;
+                    int hpDamage = oldHp - newHp;
+                    int blockDamage = Math.Max(0, oldBlock - newBlock);
+                    int shieldDamage = Math.Max(0, oldShield - newShield);
+                    int healAmount = newHp - oldHp;
 
-                    if (!RemoteCardPlaybackTracker.IsInCardPlaybackWindow)
+                    if (hpDamage > 0 || blockDamage > 0 || shieldDamage > 0)
                     {
-                        view.ComingDamage = damageInfo;
-                        view.Hit(ignoreCoolDown: true);
+                        DamageInfo damageInfo = DamageInfo.Attack(hpDamage);
+                        damageInfo.DamageBlocked = blockDamage;
+                        damageInfo.DamageShielded = shieldDamage;
 
+                        // 基于 (AttackId, TargetId) 判定是否受攻击锁定，仅对受击目标抑制抢跑跳字
+                        string enemyKey = !string.IsNullOrWhiteSpace(pending.SpawnId) ? pending.SpawnId : (pending.EnemyId ?? enemy.Id);
+                        if (!RemoteCardPlaybackTracker.IsTargetUnderAttack(enemyKey) && !RemoteCardPlaybackTracker.IsTargetUnderAttack(enemy.Id))
+                        {
+                            view.ComingDamage = damageInfo;
+                            view.Hit(ignoreCoolDown: true);
+
+                            if (PopupHud.Instance != null)
+                            {
+                                PopupHud.Instance.DamagePopupFromScene(damageInfo, view.transform.position, sourceIsPlayer: true);
+                            }
+
+                            view.OnDamageReceived(damageInfo);
+                        }
+                        else
+                        {
+                            Plugin.Logger?.LogDebug($"[EnemyStateReceive] Suppressed preemptive damage popup/hit for {enemy.Name} during targeted attack window.");
+                        }
+                    }
+                    else if (healAmount > 0)
+                    {
                         if (PopupHud.Instance != null)
                         {
-                            PopupHud.Instance.DamagePopupFromScene(damageInfo, view.transform.position, sourceIsPlayer: true);
+                            PopupHud.Instance.HealPopupFromScene(healAmount, view.transform.position);
                         }
 
-                        view.OnDamageReceived(damageInfo);
+                        view.OnHealingReceived(healAmount);
                     }
-                    else
+                    else if (newBlock != oldBlock || newShield != oldShield)
                     {
-                        Plugin.Logger?.LogDebug($"[EnemyStateReceive] Suppressed preemptive damage popup/hit for {enemy.Name} during card playback window.");
-                    }
-                }
-                else if (healAmount > 0)
-                {
-
-                    if (PopupHud.Instance != null)
-                    {
-                        PopupHud.Instance.HealPopupFromScene(healAmount, view.transform.position);
-                    }
-
-                    view.OnHealingReceived(healAmount);
-                }
-                else if (newBlock != oldBlock || newShield != oldShield)
-                {
-
-                    var widget = Traverse.Create(view).Field("_statusWidget").GetValue();
-                    if (widget != null)
-                    {
-                        Traverse.Create(widget).Method("OnBlockShieldChanged").GetValue();
+                        var widget = Traverse.Create(view).Field("_statusWidget").GetValue();
+                        if (widget != null)
+                        {
+                            Traverse.Create(widget).Method("OnBlockShieldChanged").GetValue();
+                        }
                     }
                 }
             }
-        }
-        catch (Exception ex)
-        {
-            Plugin.Logger?.LogError($"[EnemyStateReceivePatch] ApplyState presentation logic failed: {ex}");
+            catch (Exception ex)
+            {
+                Plugin.Logger?.LogError($"[EnemyStateReceivePatch] ApplyState presentation logic failed: {ex}");
+            }
         }
 
-        if (pending.StatusEffects != null)
+        // 2. 状态效果更新：仅在有状态更新且时间戳更新时应用
+        if (pending.HasStatusUpdate && pending.StatusTimestamp > pending.LastAppliedStatusTimestamp && pending.StatusEffects != null)
         {
             ApplyRemoteStatusEffectsToEnemy(enemy, pending.StatusEffects);
+            pending.LastAppliedStatusTimestamp = pending.StatusTimestamp;
         }
     }
 
@@ -597,14 +646,30 @@ public static class EnemyStateReceivePatch
         return $"root:{rootIndex}|id:{enemyId ?? ""}";
     }
 
-    private static void UpsertPending(string key, PendingState pending)
+    private static PendingState GetOrCreatePending(string spawnKey, string legacyKey)
     {
-        if (_pendingByEnemyKey.TryGetValue(key, out PendingState existing) && existing != null && existing.Timestamp >= pending.Timestamp)
+        if (_pendingByEnemyKey.TryGetValue(spawnKey, out PendingState existing) && existing != null)
         {
-            return;
+            if (!string.Equals(spawnKey, legacyKey, StringComparison.Ordinal))
+            {
+                _pendingByEnemyKey[legacyKey] = existing;
+            }
+            return existing;
         }
 
-        _pendingByEnemyKey[key] = pending;
+        if (_pendingByEnemyKey.TryGetValue(legacyKey, out existing) && existing != null)
+        {
+            _pendingByEnemyKey[spawnKey] = existing;
+            return existing;
+        }
+
+        PendingState created = new PendingState();
+        _pendingByEnemyKey[spawnKey] = created;
+        if (!string.Equals(spawnKey, legacyKey, StringComparison.Ordinal))
+        {
+            _pendingByEnemyKey[legacyKey] = created;
+        }
+        return created;
     }
 
     private static bool TryGetJsonElement(object payload, out JsonElement root)

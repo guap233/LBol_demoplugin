@@ -154,6 +154,29 @@ public static partial class OtherPlayersOverlayPatch
         }
     }
 
+    private static readonly HashSet<string> _playedActions = new(StringComparer.Ordinal);
+    private static readonly Queue<string> _playedActionOrder = new();
+    private const int MaxPlayedActionHistory = 1000;
+
+    private static bool TryRecordPlayback(string key)
+    {
+        lock (_syncLock)
+        {
+            if (_playedActions.Contains(key))
+            {
+                return false;
+            }
+            _playedActions.Add(key);
+            _playedActionOrder.Enqueue(key);
+            while (_playedActionOrder.Count > MaxPlayedActionHistory)
+            {
+                string old = _playedActionOrder.Dequeue();
+                _playedActions.Remove(old);
+            }
+            return true;
+        }
+    }
+
     private static void HandlePlayerUsUsed(JsonElement root)
     {
         try
@@ -162,6 +185,17 @@ public static partial class OtherPlayersOverlayPatch
             string usName = GetString(root, "UsName") ?? GetString(root, "CardName") ?? "符卡";
             if (!string.IsNullOrWhiteSpace(playerId) && !string.Equals(playerId, CurrentSelfPlayerId, StringComparison.Ordinal))
             {
+                string playId = GetString(root, "PlayId");
+                int actionIndex = GetInt(root, "ActionIndex", -1);
+                if (!string.IsNullOrWhiteSpace(playId) && actionIndex >= 0)
+                {
+                    string dedupKey = $"us|{playerId}|{playId}|{actionIndex}";
+                    if (!TryRecordPlayback(dedupKey))
+                    {
+                        return;
+                    }
+                }
+
                 JsonElement? actions = root.TryGetProperty("Actions", out JsonElement actionsEl) && actionsEl.ValueKind == JsonValueKind.Array ? actionsEl : null;
                 TriggerRemoteCharacterCardUseEffect(playerId, usName, isUs: true, actions);
             }
@@ -180,6 +214,17 @@ public static partial class OtherPlayersOverlayPatch
             string cardName = GetString(root, "CardName") ?? "卡牌";
             if (!string.IsNullOrWhiteSpace(playerId) && !string.Equals(playerId, CurrentSelfPlayerId, StringComparison.Ordinal))
             {
+                string playId = GetString(root, "PlayId");
+                int actionIndex = GetInt(root, "ActionIndex", -1);
+                if (!string.IsNullOrWhiteSpace(playId) && actionIndex >= 0)
+                {
+                    string dedupKey = $"card|{playerId}|{playId}|{actionIndex}";
+                    if (!TryRecordPlayback(dedupKey))
+                    {
+                        return;
+                    }
+                }
+
                 JsonElement? actions = root.TryGetProperty("Actions", out JsonElement actionsEl) && actionsEl.ValueKind == JsonValueKind.Array ? actionsEl : null;
                 TriggerRemoteCharacterCardUseEffect(playerId, cardName, isUs: false, actions);
             }
@@ -447,6 +492,18 @@ public static partial class OtherPlayersOverlayPatch
         {
             _players.Remove(playerId);
         }
+
+        Plugin.RunOnMainThread(() =>
+        {
+            if (_ui?.Entries != null && _ui.Entries.TryGetValue(playerId, out var entryUi))
+            {
+                if (entryUi?.Root != null)
+                {
+                    UnityEngine.Object.Destroy(entryUi.Root);
+                }
+                _ui.Entries.Remove(playerId);
+            }
+        });
 
         RemoveRemoteCharacter(playerId);
         HideMapIcon(playerId);

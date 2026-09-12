@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Threading;
@@ -66,6 +66,36 @@ public class NetworkClient : INetworkClient
 
     #endregion
 
+    #region 会话与重连凭证
+
+        private string _lastSessionPlayerId;
+        private string _lastSessionReconnectToken;
+        private string _lastSessionNonce;
+        private string _lastSessionEndpoint;
+        private volatile bool _isAwaitingReconnectResponse;
+
+        public void ClearSessionCredentials()
+        {
+            _lastSessionPlayerId = null;
+            _lastSessionReconnectToken = null;
+            _lastSessionNonce = null;
+            _lastSessionEndpoint = null;
+            _isAwaitingReconnectResponse = false;
+            Plugin.Logger?.LogInfo("[客户端] 会话重连凭证已清除。");
+        }
+
+        internal void SetSessionCredentialsForTest(string playerId, string token, string endpoint)
+        {
+            _lastSessionPlayerId = playerId;
+            _lastSessionReconnectToken = token;
+            _lastSessionEndpoint = endpoint;
+        }
+
+        internal string LastSessionPlayerIdForTest => _lastSessionPlayerId;
+        internal string LastSessionReconnectTokenForTest => _lastSessionReconnectToken;
+
+    #endregion
+
     #region Payload 日志去重
 
         private readonly object _payloadPreviewLock = new();
@@ -78,7 +108,7 @@ public class NetworkClient : INetworkClient
         private ConfigManager _configManager;
 
         public NetworkClient(ConfigManager configManager, ISynchronizationManager synchronizationManager)
-        : this(configManager?.RelayServerConnectionKey?.Value ?? "LBoL_Network_Plugin", null, null, synchronizationManager)
+        : this(configManager?.RelayServerConnectionKey?.Value ?? NetworkPlugin.Network.Security.SecurityUtils.GenerateSecureKey(), null, null, synchronizationManager)
     {
         _configManager = configManager;
         try
@@ -179,61 +209,20 @@ public class NetworkClient : INetworkClient
                 Plugin.Logger?.LogWarning($"[客户端] 通知同步管理器失败: {ex.Message}");
             }
 
-            string playerName = null;
-            try
+            if (!string.IsNullOrWhiteSpace(_lastSessionPlayerId) && !string.IsNullOrWhiteSpace(_lastSessionReconnectToken))
             {
-                playerName = _networkManager?.GetSelf()?.userName;
-                if (string.IsNullOrWhiteSpace(playerName))
+                Plugin.Logger?.LogInfo($"[客户端] 检测到历史会话凭证，尝试恢复身份: playerId={_lastSessionPlayerId}");
+                _isAwaitingReconnectResponse = true;
+                SendRawJson(NetworkMessageTypes.Reconnect_REQUEST, JsonCompat.Serialize(new
                 {
-                    playerName = _networkPlayer?.userName;
-                }
-                if (string.IsNullOrWhiteSpace(playerName))
-                {
-                    playerName = GetSelf()?.userName;
-                }
+                    PlayerId = _lastSessionPlayerId,
+                    ReconnectToken = _lastSessionReconnectToken
+                }));
             }
-            catch
+            else
             {
-
+                SendPlayerJoined();
             }
-
-            if (string.IsNullOrWhiteSpace(playerName))
-            {
-                playerName = "Player";
-            }
-
-            string characterId = null;
-            try
-            {
-
-                var startGamePanel = LBoL.Presentation.UI.UiManager.GetPanel<LBoL.Presentation.UI.Panels.StartGamePanel>();
-                if (startGamePanel != null)
-                {
-                    var playerUnit = HarmonyLib.Traverse.Create(startGamePanel).Field("_player").GetValue<LBoL.Core.Units.PlayerUnit>();
-                    if (playerUnit != null)
-                    {
-                        characterId = playerUnit.Id;
-                    }
-                }
-                if (string.IsNullOrEmpty(characterId))
-                {
-
-                    characterId = GameStateUtils.GetCurrentPlayer()?.ModelName;
-                }
-            }
-            catch
-            {
-
-            }
-
-            var playerInfo = new
-            {
-                PlayerName = playerName,
-                CharacterId = characterId,
-                ConnectionTime = DateTime.Now.Ticks
-            };
-
-            SendGameEventData(NetworkMessageTypes.PlayerJoined, playerInfo);
         };
 
         _listener.PeerDisconnectedEvent += (peer, disconnectInfo) =>
@@ -268,23 +257,23 @@ public class NetworkClient : INetworkClient
         {
             try
             {
-
                 string messageType = dataReader.GetString();
 
                 if (IsGameEvent(messageType))
                 {
-
                     HandleGameEvent(messageType, dataReader);
                 }
                 else if (string.Equals(messageType, NetworkMessageTypes.HeartbeatResponse, StringComparison.Ordinal))
                 {
-
                     _ = dataReader.GetString();
                 }
                 else if (string.Equals(messageType, NetworkMessageTypes.GetSelf_RESPONSE, StringComparison.Ordinal))
                 {
-
                     HandleRequestResponse(fromPeer, dataReader);
+                }
+                else if (string.Equals(messageType, NetworkMessageTypes.Reconnect_RESPONSE, StringComparison.Ordinal))
+                {
+                    HandleReconnectResponse(fromPeer, dataReader);
                 }
                 else
                 {
@@ -297,10 +286,127 @@ public class NetworkClient : INetworkClient
             }
             finally
             {
-
                 dataReader.Recycle();
             }
         };
+    }
+
+    private void SendPlayerJoined()
+    {
+        string playerName = null;
+        try
+        {
+            playerName = _networkManager?.GetSelf()?.userName;
+            if (string.IsNullOrWhiteSpace(playerName))
+            {
+                playerName = _networkPlayer?.userName;
+            }
+            if (string.IsNullOrWhiteSpace(playerName))
+            {
+                playerName = GetSelf()?.userName;
+            }
+        }
+        catch
+        {
+
+        }
+
+        if (string.IsNullOrWhiteSpace(playerName))
+        {
+            playerName = "Player";
+        }
+
+        string characterId = null;
+        try
+        {
+            var startGamePanel = LBoL.Presentation.UI.UiManager.GetPanel<LBoL.Presentation.UI.Panels.StartGamePanel>();
+            if (startGamePanel != null)
+            {
+                var playerUnit = HarmonyLib.Traverse.Create(startGamePanel).Field("_player").GetValue<LBoL.Core.Units.PlayerUnit>();
+                if (playerUnit != null)
+                {
+                    characterId = playerUnit.Id;
+                }
+            }
+            if (string.IsNullOrEmpty(characterId))
+            {
+                characterId = GameStateUtils.GetCurrentPlayer()?.ModelName;
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger?.LogDebug($"[NetworkClient] CharacterId retrieval error: {ex.Message}");
+        }
+
+        var playerInfo = new
+        {
+            PlayerName = playerName,
+            CharacterId = characterId,
+            ConnectionTime = DateTime.Now.Ticks
+        };
+
+        SendGameEventData(NetworkMessageTypes.PlayerJoined, playerInfo);
+    }
+
+    private void HandleReconnectResponse(NetPeer fromPeer, NetDataReader dataReader)
+    {
+        try
+        {
+            string jsonPayload = dataReader.GetString();
+            using var doc = System.Text.Json.JsonDocument.Parse(jsonPayload);
+            var root = doc.RootElement;
+            bool success = root.TryGetProperty("Success", out var sElem) && sElem.GetBoolean();
+            if (success)
+            {
+                string playerId = root.TryGetProperty("PlayerId", out var pElem) ? pElem.GetString() : _lastSessionPlayerId;
+                string newToken = root.TryGetProperty("ReconnectToken", out var tElem) ? tElem.GetString() : null;
+                string nonce = root.TryGetProperty("SessionNonce", out var nElem) ? nElem.GetString() : null;
+                bool isHost = root.TryGetProperty("IsHost", out var hElem) && hElem.GetBoolean();
+
+                _lastSessionPlayerId = playerId;
+                if (!string.IsNullOrWhiteSpace(newToken))
+                {
+                    _lastSessionReconnectToken = newToken;
+                }
+                if (!string.IsNullOrWhiteSpace(nonce))
+                {
+                    _lastSessionNonce = nonce;
+                }
+
+                _isAwaitingReconnectResponse = false;
+                Plugin.Logger?.LogInfo($"[客户端] 重连身份恢复成功: playerId={playerId}, isHost={isHost}");
+
+                OnGameEventReceived?.Invoke(NetworkMessageTypes.Reconnect_RESPONSE, jsonPayload);
+            }
+            else
+            {
+                string err = root.TryGetProperty("Error", out var eElem) ? eElem.GetString() : "Unknown";
+                Plugin.Logger?.LogWarning($"[客户端] 重连恢复失败 ({err})，回退为全新加入流程");
+                ClearSessionCredentials();
+                _isAwaitingReconnectResponse = false;
+                SendPlayerJoined();
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger?.LogError($"[客户端] 处理重连响应异常: {ex.Message}");
+            ClearSessionCredentials();
+            _isAwaitingReconnectResponse = false;
+            SendPlayerJoined();
+        }
+    }
+
+    private void SendRawJson(string messageType, string json)
+    {
+        if (!IsConnected || _serverPeer == null)
+        {
+            return;
+        }
+
+        NetDataWriter writer = new NetDataWriter();
+        writer.Put(messageType);
+        writer.Put(json ?? string.Empty);
+        _serverPeer.Send(writer, DeliveryMethod.ReliableOrdered);
     }
 
         private bool IsGameEvent(string messageType)
@@ -378,6 +484,37 @@ public class NetworkClient : INetworkClient
 
             OnGameEventReceived?.Invoke(eventType, eventData);
 
+            if (string.Equals(eventType, NetworkMessageTypes.Welcome, StringComparison.Ordinal))
+            {
+                try
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(jsonPayload);
+                    var root = doc.RootElement;
+                    string pid = root.TryGetProperty("PlayerId", out var pElem) ? pElem.GetString() : null;
+                    string token = root.TryGetProperty("ReconnectToken", out var tElem) ? tElem.GetString() : null;
+                    string nonce = root.TryGetProperty("SessionNonce", out var nElem) ? nElem.GetString() : null;
+
+                    if (!string.IsNullOrWhiteSpace(pid))
+                    {
+                        _lastSessionPlayerId = pid;
+                    }
+                    if (!string.IsNullOrWhiteSpace(token))
+                    {
+                        _lastSessionReconnectToken = token;
+                    }
+                    if (!string.IsNullOrWhiteSpace(nonce))
+                    {
+                        _lastSessionNonce = nonce;
+                    }
+
+                    Plugin.Logger?.LogInfo($"[客户端] 已记录当前会话凭证: playerId={_lastSessionPlayerId}");
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Logger?.LogDebug($"[NetworkClient] Welcome credentials parse error: {ex.Message}");
+                }
+            }
+
             _synchronizationManager?.ProcessEventFromNetwork(new
             {
                 EventType = eventType,
@@ -420,6 +557,14 @@ public class NetworkClient : INetworkClient
 
         public void ConnectToServer(string host, int port)
     {
+        string currentEndpoint = $"{host}:{port}";
+        if (!string.IsNullOrWhiteSpace(_lastSessionEndpoint) &&
+            !string.Equals(currentEndpoint, _lastSessionEndpoint, StringComparison.OrdinalIgnoreCase))
+        {
+            ClearSessionCredentials();
+        }
+        _lastSessionEndpoint = currentEndpoint;
+
         _lastConnectHost = host;
         _lastConnectPort = port;
 
@@ -434,26 +579,38 @@ public class NetworkClient : INetworkClient
                 {
                     if (NetworkPlugin.Patch.UI.MainMenuMultiplayerEntryPatch.IsLocalServerRunning)
                     {
-                        keyToUse = config.HostConnectionKey?.Value ?? "LBoL_Network_Plugin";
+                        keyToUse = config.HostConnectionKey?.Value ?? NetworkPlugin.Network.Security.SecurityUtils.GenerateSecureKey();
                     }
                     else
                     {
-                        keyToUse = config.HostConnectionKey?.Value ?? config.RelayServerConnectionKey?.Value ?? "LBoL_Network_Plugin";
+                        keyToUse = config.HostConnectionKey?.Value ?? config.RelayServerConnectionKey?.Value ?? NetworkPlugin.Network.Security.SecurityUtils.GenerateSecureKey();
                     }
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
-
+            Plugin.Logger?.LogDebug($"[NetworkClient] GetConfig error: {ex.Message}");
         }
 
         Plugin.Logger?.LogInfo($"[客户端] 正在连接服务器 {host}:{port}（密钥: <已隐藏>）...");
         NetDataWriter connectData = new();
 
-        connectData.Put(keyToUse);
+        connectData.Put(keyToUse ?? string.Empty);
+        connectData.Put(NetworkConstants.ProtocolVersion);
 
-        _netManager.Connect(host, port, connectData);
+        try
+        {
+            if (!_netManager.IsRunning)
+            {
+                Start();
+            }
+            _netManager.Connect(host, port, connectData);
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger?.LogWarning($"[客户端] 发起连接异常: {ex.Message}");
+        }
     }
 
         public void PollEvents()

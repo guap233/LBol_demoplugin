@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Reflection;
 using HarmonyLib;
 using LBoL.Core;
@@ -75,37 +75,16 @@ public static class ExitGamePatch
 
     #region 断开联机与返回主菜单流程
 
-        private static void DisconnectMultiplayer()
+    private static void DisconnectMultiplayer()
     {
         try
         {
-
-            TryGetNetworkClient()?.Stop();
-
-            Plugin.Logger?.LogInfo("[退出/返回主菜单] 已断开联机连接");
+            MainMenuMultiplayerEntryPatch.ShutdownMultiplayerSession();
+            Plugin.Logger?.LogInfo("[退出/返回主菜单] 已断开联机连接并重置联机状态");
         }
         catch (Exception ex)
         {
-            Plugin.Logger?.LogError($"[退出/返回主菜单] 停止网络客户端失败: {ex.Message}");
-        }
-
-        try
-        {
-            INetworkManager manager = TryGetNetworkManager();
-            if (manager == null)
-                return;
-
-            MethodInfo clear = manager
-                .GetType()
-                .GetMethod(
-                    "ClearAllPlayers",
-                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic
-                );
-            clear?.Invoke(manager, null);
-        }
-        catch (Exception ex)
-        {
-            Plugin.Logger?.LogError($"[退出/返回主菜单] 清理玩家列表失败: {ex.Message}");
+            Plugin.Logger?.LogError($"[退出/返回主菜单] 统一关闭联机失败: {ex.Message}");
         }
     }
 

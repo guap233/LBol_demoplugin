@@ -113,6 +113,9 @@ public static class MainMenuMultiplayerEntryPatch
     private static Thread _localServerThread;
     private static CancellationTokenSource _localServerCts;
 
+    private static long _sessionGeneration = 0;
+    private static bool _hasEnteredGameRun = false;
+
     #endregion
 
     #region 依赖注入获取
@@ -1432,7 +1435,7 @@ public static class MainMenuMultiplayerEntryPatch
             ConfigManager config = TryGetConfig();
             string curIp = config?.ServerIP?.Value ?? "127.0.0.1";
             string curPort = config?.ServerPort?.Value.ToString() ?? "7777";
-            string curKey = config?.HostConnectionKey?.Value ?? "LBoL_Network_Plugin";
+            string curKey = config?.HostConnectionKey?.Value ?? NetworkPlugin.Network.Security.SecurityUtils.GenerateSecureKey();
             string curName = config?.PlayerNameOverride?.Value;
             if (string.IsNullOrWhiteSpace(curName))
             {
@@ -1580,7 +1583,7 @@ public static class MainMenuMultiplayerEntryPatch
 
             string hostPort = config?.HostServerPort?.Value.ToString() ?? "7777";
             string hostMaxConn = config?.HostMaxConnections?.Value.ToString() ?? "4";
-            string hostKey = config?.HostConnectionKey?.Value ?? "LBoL_Network_Plugin";
+            string hostKey = config?.HostConnectionKey?.Value ?? NetworkPlugin.Network.Security.SecurityUtils.GenerateSecureKey();
             string hostName = config?.HostPlayerNameOverride?.Value;
             if (string.IsNullOrWhiteSpace(hostName))
             {
@@ -2650,12 +2653,16 @@ public static class MainMenuMultiplayerEntryPatch
         }
     }
 
-        public static void OnLobbyGameStartedReceived()
+    public static void OnLobbyGameStartedReceived()
     {
         try
         {
-
-            HideRoomListOverlay();
+            if (_hasEnteredGameRun)
+            {
+                Plugin.Logger?.LogWarning("[MainMenuMultiplayerEntry] OnLobbyGameStartedReceived: 已进入游戏，忽略重复广播");
+                return;
+            }
+            HideRoomListOverlay(immediate: true);
 
             Singleton<GameMaster>.Instance.StartCoroutine(DelayedStartGame());
         }
@@ -2667,6 +2674,14 @@ public static class MainMenuMultiplayerEntryPatch
 
     private static IEnumerator DelayedStartGame()
     {
+        if (_hasEnteredGameRun)
+        {
+            Plugin.Logger?.LogWarning("[MainMenuMultiplayerEntry] DelayedStartGame: 已进入游戏，忽略重复调用");
+            yield break;
+        }
+        _hasEnteredGameRun = true;
+        HideRoomListOverlay(immediate: true);
+
         yield return null;
         _isSilentStarting = true;
         GameMasterSaveHookPatch.IsMultiplayerRunActive = true;
@@ -3015,14 +3030,27 @@ public static class MainMenuMultiplayerEntryPatch
             });
 
             bool isResume = _lobbyResumeMode || _clientLobbyResumeMode;
+            bool hostInGrace = !selfIsHost && NetworkIdentityTracker.IsHostInGracePeriod() && !NetworkIdentityTracker.HasOnlineHost();
+
             if (_roomListTitleText != null)
             {
-                _roomListTitleText.text = isResume ? "联机房间【继续存档】" : "房间玩家列表";
+                if (hostInGrace)
+                {
+                    _roomListTitleText.text = "联机房间【房主已断线】";
+                }
+                else
+                {
+                    _roomListTitleText.text = isResume ? "联机房间【继续存档】" : "房间玩家列表";
+                }
             }
 
             if (_roomListEmptyText != null)
             {
-                if (isResume)
+                if (hostInGrace)
+                {
+                    _roomListEmptyText.text = "【房主已断线】等待房主恢复连接中…";
+                }
+                else if (isResume)
                 {
                     if (selfIsHost)
                     {
@@ -3130,7 +3158,6 @@ public static class MainMenuMultiplayerEntryPatch
         {
             if (selfIsHost)
             {
-
                 bool allReady = AreAllClientsReady(selfId);
                 _readyOrStartButton.interactable = allReady;
                 var label = _readyOrStartButton.GetComponentInChildren<TextMeshProUGUI>();
@@ -3138,11 +3165,22 @@ public static class MainMenuMultiplayerEntryPatch
             }
             else
             {
+                bool hasOnlineHost = NetworkIdentityTracker.HasOnlineHost();
+                bool hostInGrace = NetworkIdentityTracker.IsHostInGracePeriod();
 
-                bool isReady = _playerReadyStates.TryGetValue(selfId ?? "", out var rdy) && rdy;
-                _readyOrStartButton.interactable = true;
-                var label = _readyOrStartButton.GetComponentInChildren<TextMeshProUGUI>();
-                if (label != null) label.text = isReady ? "取消准备" : "准备就绪";
+                if (!hasOnlineHost && hostInGrace)
+                {
+                    _readyOrStartButton.interactable = false;
+                    var label = _readyOrStartButton.GetComponentInChildren<TextMeshProUGUI>();
+                    if (label != null) label.text = "【房主已断线】等待恢复…";
+                }
+                else
+                {
+                    bool isReady = _playerReadyStates.TryGetValue(selfId ?? "", out var rdy) && rdy;
+                    _readyOrStartButton.interactable = true;
+                    var label = _readyOrStartButton.GetComponentInChildren<TextMeshProUGUI>();
+                    if (label != null) label.text = isReady ? "取消准备" : "准备就绪";
+                }
             }
         }
         catch (Exception ex)
@@ -3178,8 +3216,15 @@ public static class MainMenuMultiplayerEntryPatch
             {
                 if (AreAllClientsReady(selfId))
                 {
+                    if (_hasEnteredGameRun)
+                    {
+                        Plugin.Logger?.LogWarning("[MainMenuMultiplayerEntry] 房主已在开局流程中，忽略重复点击");
+                        return;
+                    }
+
                     if (_lobbyResumeMode && _resumingSave != null)
                     {
+                        _hasEnteredGameRun = true;
                         Plugin.Logger?.LogInfo("[MainMenuMultiplayerEntry] 房主点击开始游戏 (继续存档模式)");
 
                         // 1. 广播恢复发车通知
@@ -3208,7 +3253,7 @@ public static class MainMenuMultiplayerEntryPatch
 
                         // 3. 标记联机运行活跃并恢复游戏
                         GameMasterSaveHookPatch.IsMultiplayerRunActive = true;
-                        HideRoomListOverlay();
+                        HideRoomListOverlay(immediate: true);
                         Plugin.Logger?.LogInfo("[MainMenuMultiplayerEntry] 房主跳过角色/难度确认，直接恢复存档进入游戏...");
                         GameMaster.RestoreGameRun(_resumingSave);
 
@@ -3217,6 +3262,7 @@ public static class MainMenuMultiplayerEntryPatch
                         return;
                     }
 
+                    _hasEnteredGameRun = true;
                     Plugin.Logger?.LogInfo("[MainMenuMultiplayerEntry] 房主开始游戏");
                     GameMasterSaveHookPatch.IsMultiplayerRunActive = true;
                     StartGamePanel startGamePanel = UiManager.GetPanel<StartGamePanel>();
@@ -3224,7 +3270,7 @@ public static class MainMenuMultiplayerEntryPatch
                         ? Traverse.Create(startGamePanel).Field("characterConfirmButton").GetValue<Button>()
                         : null;
                     confirmBtn?.onClick?.Invoke();
-                    HideRoomListOverlay();
+                    HideRoomListOverlay(immediate: true);
                 }
             }
             else
@@ -3455,10 +3501,19 @@ public static class MainMenuMultiplayerEntryPatch
         return NetworkIdentityTracker.GetSelfPlayerId() ?? "我";
     }
 
-    private static void HideRoomListOverlay()
+    internal static void HideRoomListOverlay()
+    {
+        HideRoomListOverlay(false);
+    }
+
+    internal static void HideRoomListOverlay(bool immediate)
     {
         if (_roomListRoot == null) return;
-        if (_roomListAnimator != null && _roomListRoot.activeInHierarchy)
+        if (immediate)
+        {
+            _roomListRoot.SetActive(false);
+        }
+        else if (_roomListAnimator != null && _roomListRoot.activeInHierarchy)
         {
             _roomListAnimator.PlayClose(() => _roomListRoot.SetActive(false));
         }
@@ -3601,7 +3656,12 @@ public static class MainMenuMultiplayerEntryPatch
 
             Plugin.RunOnMainThread(() =>
             {
-                HideRoomListOverlay();
+                if (_hasEnteredGameRun)
+                {
+                    Plugin.Logger?.LogWarning("[MainMenuMultiplayerEntry] HandleLobbyResumeGameReceived: 已在游戏对局中，忽略广播");
+                    return;
+                }
+                HideRoomListOverlay(immediate: true);
                 GameMasterSaveHookPatch.IsMultiplayerRunActive = true;
 
                 bool wasOld = _isOldResumePlayer;
@@ -3619,6 +3679,7 @@ public static class MainMenuMultiplayerEntryPatch
                     if (localSave != null && localSave.RootSeed == targetSeed)
                     {
                         Plugin.Logger?.LogInfo($"[MainMenuMultiplayerEntry] 老玩家客机：本地存档校验匹配成功 (Seed={localSave.RootSeed})，直接恢复进入关卡！");
+                        _hasEnteredGameRun = true;
                         GameMaster.RestoreGameRun(localSave);
                         return;
                     }
@@ -3803,7 +3864,8 @@ public static class MainMenuMultiplayerEntryPatch
     {
         if (_connStatusRoot != null)
         {
-            try { _connStatusAnimator?.PlayClose(); } catch {  }
+            try { _connStatusAnimator?.PlayClose(); }
+            catch (Exception ex) { Plugin.Logger?.LogDebug($"[MainMenuMultiplayerEntryPatch] PlayClose error: {ex.Message}"); }
             UnityEngine.Object.Destroy(_connStatusRoot);
         }
         _connStatusRoot = null;
@@ -3815,13 +3877,18 @@ public static class MainMenuMultiplayerEntryPatch
 
     #region 连接等待与房间列表弹出
 
-        private static IEnumerator CoWaitForConnectedThenShowRoomList(float timeoutSeconds = 8f)
+    private static IEnumerator CoWaitForConnectedThenShowRoomList(float timeoutSeconds = 8f, bool isGuest = false, long expectedGen = 0)
     {
         INetworkClient client = TryGetNetworkClient();
         float start = Time.realtimeSinceStartup;
 
         while (Time.realtimeSinceStartup - start < timeoutSeconds)
         {
+            if (expectedGen != 0 && expectedGen != _sessionGeneration)
+            {
+                yield break;
+            }
+
             bool connected = false;
             try
             {
@@ -3833,6 +3900,11 @@ public static class MainMenuMultiplayerEntryPatch
             }
             if (connected) break;
             yield return null;
+        }
+
+        if (expectedGen != 0 && expectedGen != _sessionGeneration)
+        {
+            yield break;
         }
 
         bool ok = false;
@@ -3869,11 +3941,51 @@ public static class MainMenuMultiplayerEntryPatch
             yield break;
         }
 
+        if (isGuest)
+        {
+            float hostWaitStart = Time.realtimeSinceStartup;
+            while (Time.realtimeSinceStartup - hostWaitStart < 3.0f)
+            {
+                if (expectedGen != 0 && expectedGen != _sessionGeneration)
+                {
+                    yield break;
+                }
+
+                if (NetworkIdentityTracker.HasOnlineHost() || NetworkIdentityTracker.IsHostInGracePeriod())
+                {
+                    break;
+                }
+                yield return null;
+            }
+
+            if (expectedGen != 0 && expectedGen != _sessionGeneration)
+            {
+                yield break;
+            }
+
+            if (!NetworkIdentityTracker.HasOnlineHost() && !NetworkIdentityTracker.IsHostInGracePeriod())
+            {
+                Plugin.Logger?.LogWarning("[MainMenuMultiplayerEntry] 目标房间暂无在线房主，无法进入房间。");
+                ShutdownMultiplayerSession();
+                UiManager.GetDialog<MessageDialog>().Show(
+                    new MessageContent
+                    {
+                        Text = "目标房间暂无在线房主，无法开始游戏。\n\n请确认房主已创建房间并处于在线状态。",
+                        Icon = MessageIcon.Warning,
+                        Buttons = DialogButtons.Confirm,
+                    }
+                );
+                yield break;
+            }
+        }
+
         ShowRoomPlayerListOverlay();
     }
 
-        internal static void TryConnectToServerAndShowRoomList(string host, int port)
+    internal static void TryConnectToServerAndShowRoomList(string host, int port)
     {
+        long gen = Interlocked.Increment(ref _sessionGeneration);
+        _hasEnteredGameRun = false;
         ShowConnectionStatusOverlay($"正在连接到 {host}:{port}…");
         bool started = TryConnectToServer(host, port);
         if (!started)
@@ -3885,7 +3997,7 @@ public static class MainMenuMultiplayerEntryPatch
         try
         {
             SubscribeRoomListEvents();
-            Singleton<GameMaster>.Instance.StartCoroutine(CoWaitForConnectedThenShowRoomList());
+            Singleton<GameMaster>.Instance.StartCoroutine(CoWaitForConnectedThenShowRoomList(8f, isGuest: true, gen));
         }
         catch
         {
@@ -3893,15 +4005,17 @@ public static class MainMenuMultiplayerEntryPatch
         }
     }
 
-        internal static void TryHostLocalServerAndConnectAndShowRoomList()
+    internal static void TryHostLocalServerAndConnectAndShowRoomList()
     {
+        long gen = Interlocked.Increment(ref _sessionGeneration);
+        _hasEnteredGameRun = false;
         ShowConnectionStatusOverlay("正在启动本机服务器…");
         TryHostLocalServerAndConnect();
         UpdateConnectionStatusText("正在连接到本机服务器…");
         try
         {
             SubscribeRoomListEvents();
-            Singleton<GameMaster>.Instance.StartCoroutine(CoWaitForConnectedThenShowRoomList());
+            Singleton<GameMaster>.Instance.StartCoroutine(CoWaitForConnectedThenShowRoomList(8f, isGuest: false, gen));
         }
         catch
         {
@@ -3922,19 +4036,19 @@ public static class MainMenuMultiplayerEntryPatch
             port = 7777;
         }
         int maxConn = config?.HostMaxConnections?.Value ?? 4;
-        string key = config?.HostConnectionKey?.Value ?? "LBoL_Network_Plugin";
+        string key = config?.HostConnectionKey?.Value ?? NetworkPlugin.Network.Security.SecurityUtils.GenerateSecureKey();
+        string listenAddr = config?.HostListenAddress?.Value ?? "0.0.0.0";
 
         try
         {
-
             if (!_localServerRunning)
             {
-                _localServer = new NetworkServer(port, maxConn, key, Plugin.Logger);
+                _localServer = new NetworkServer(port, maxConn, key, Plugin.Logger, listenAddr);
                 _localServer.Start();
                 _localServerRunning = true;
                 StartLocalServerLoop();
 
-                Plugin.Logger?.LogInfo($"[MainMenuMultiplayerEntry] Host server started: 127.0.0.1:{port}");
+                Plugin.Logger?.LogInfo($"[MainMenuMultiplayerEntry] Host server started: {listenAddr}:{port}");
             }
         }
         catch (Exception ex)
@@ -3961,6 +4075,9 @@ public static class MainMenuMultiplayerEntryPatch
             return;
         }
 
+        long gen = Interlocked.Increment(ref _sessionGeneration);
+        _hasEnteredGameRun = false;
+
         try
         {
             TryHostLocalServerAndConnect();
@@ -3973,7 +4090,7 @@ public static class MainMenuMultiplayerEntryPatch
 
         try
         {
-            Singleton<GameMaster>.Instance.StartCoroutine(CoWaitForConnectedThenRestore(save));
+            Singleton<GameMaster>.Instance.StartCoroutine(CoWaitForConnectedThenRestore(save, gen));
         }
         catch
         {
@@ -3981,7 +4098,7 @@ public static class MainMenuMultiplayerEntryPatch
         }
     }
 
-    private static IEnumerator CoWaitForConnectedThenRestore(GameRunSaveData save)
+    private static IEnumerator CoWaitForConnectedThenRestore(GameRunSaveData save, long expectedGen = 0)
     {
         INetworkClient client = TryGetNetworkClient();
 
@@ -3990,6 +4107,11 @@ public static class MainMenuMultiplayerEntryPatch
 
         while (Time.realtimeSinceStartup - start < timeoutSeconds)
         {
+            if (expectedGen != 0 && expectedGen != _sessionGeneration)
+            {
+                yield break;
+            }
+
             try
             {
                 if (client != null && client.IsConnected)
@@ -4003,6 +4125,11 @@ public static class MainMenuMultiplayerEntryPatch
             }
 
             yield return null;
+        }
+
+        if (expectedGen != 0 && expectedGen != _sessionGeneration)
+        {
+            yield break;
         }
 
         bool connected = false;
@@ -4101,11 +4228,14 @@ public static class MainMenuMultiplayerEntryPatch
             return;
         }
 
+        long gen = Interlocked.Increment(ref _sessionGeneration);
+        _hasEnteredGameRun = false;
+
         TryConnectToServer(host, port);
 
         try
         {
-            Singleton<GameMaster>.Instance.StartCoroutine(CoWaitForConnectedThenRestoreThenCatchUp(save));
+            Singleton<GameMaster>.Instance.StartCoroutine(CoWaitForConnectedThenRestoreThenCatchUp(save, gen));
         }
         catch
         {
@@ -4113,7 +4243,7 @@ public static class MainMenuMultiplayerEntryPatch
         }
     }
 
-    private static IEnumerator CoWaitForConnectedThenRestoreThenCatchUp(GameRunSaveData save)
+    private static IEnumerator CoWaitForConnectedThenRestoreThenCatchUp(GameRunSaveData save, long expectedGen = 0)
     {
         INetworkClient client = TryGetNetworkClient();
 
@@ -4122,6 +4252,11 @@ public static class MainMenuMultiplayerEntryPatch
 
         while (Time.realtimeSinceStartup - start < timeoutSeconds)
         {
+            if (expectedGen != 0 && expectedGen != _sessionGeneration)
+            {
+                yield break;
+            }
+
             bool connected = false;
             try
             {
@@ -4138,6 +4273,11 @@ public static class MainMenuMultiplayerEntryPatch
             }
 
             yield return null;
+        }
+
+        if (expectedGen != 0 && expectedGen != _sessionGeneration)
+        {
+            yield break;
         }
 
         bool ok = false;
@@ -4322,15 +4462,23 @@ public static class MainMenuMultiplayerEntryPatch
         }
     }
 
-        private static void Disconnect(INetworkClient client)
+    public static void ShutdownMultiplayerSession(bool clearCredentials = true)
     {
+        Interlocked.Increment(ref _sessionGeneration);
+        _hasEnteredGameRun = false;
+
+        INetworkClient client = TryGetNetworkClient();
         try
         {
+            if (clearCredentials)
+            {
+                client?.ClearSessionCredentials();
+            }
             client?.Stop();
         }
-        catch
+        catch (Exception ex)
         {
-
+            Plugin.Logger?.LogWarning($"[MainMenuMultiplayerEntry] Stop client error: {ex.Message}");
         }
 
         StopLocalServerLoop();
@@ -4342,15 +4490,60 @@ public static class MainMenuMultiplayerEntryPatch
                 _localServer?.Stop();
             }
         }
-        catch
+        catch (Exception ex)
         {
-
+            Plugin.Logger?.LogWarning($"[MainMenuMultiplayerEntry] Stop local server error: {ex.Message}");
         }
         finally
         {
             _localServer = null;
             _localServerRunning = false;
         }
+
+        try
+        {
+            INetworkManager manager = ServiceProvider?.GetService<INetworkManager>();
+            manager?.ClearAllPlayers();
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger?.LogWarning($"[MainMenuMultiplayerEntry] ClearAllPlayers error: {ex.Message}");
+        }
+
+        try
+        {
+            _playerReadyStates.Clear();
+            _lobbyResumeMode = false;
+            _resumingSave = null;
+            _clientLobbyResumeMode = false;
+            _isOldResumePlayer = false;
+            _hostResumeRootSeed = 0;
+
+            HideRoomListOverlay(immediate: true);
+            HideConnectionStatusOverlay();
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger?.LogWarning($"[MainMenuMultiplayerEntry] UI cleanup error: {ex.Message}");
+        }
+    }
+
+    private static void Disconnect(INetworkClient client)
+    {
+        try
+        {
+            if (client != null && client.IsConnected)
+            {
+                string selfId = NetworkIdentityTracker.GetSelfPlayerId();
+                client.SendRequest(NetworkMessageTypes.LeaveRoom, new { PlayerId = selfId });
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger?.LogWarning($"[MainMenuMultiplayerEntry] Send LeaveRoom error: {ex.Message}");
+        }
+
+        ShutdownMultiplayerSession(clearCredentials: false);
     }
 
     #endregion

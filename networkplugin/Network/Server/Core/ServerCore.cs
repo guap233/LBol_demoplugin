@@ -1,4 +1,4 @@
-﻿#nullable enable
+#nullable enable
 using System;
 using System.Collections.Generic;
 using System.Threading;
@@ -55,9 +55,18 @@ public sealed class ServerCore : IServerCore
             return;
         }
 
-        NetManager.Start(Options.Port);
+        if (!string.IsNullOrWhiteSpace(Options.ListenAddress) &&
+            System.Net.IPAddress.TryParse(Options.ListenAddress, out var ip) &&
+            !System.Net.IPAddress.Any.Equals(ip))
+        {
+            NetManager.Start(ip, System.Net.IPAddress.IPv6Any, Options.Port);
+        }
+        else
+        {
+            NetManager.Start(Options.Port);
+        }
         _isRunning = true;
-        Logger.Info($"[ServerCore] Server started on port {Options.Port}");
+        Logger.Info($"[ServerCore] Server started on port {Options.Port}, bind={Options.ListenAddress}");
 
         if (Options.UseBackgroundThread)
         {
@@ -80,7 +89,7 @@ public sealed class ServerCore : IServerCore
 
         _isRunning = false;
         try { _cts?.Cancel(); }
-        catch (ObjectDisposedException) {  }
+        catch (ObjectDisposedException ex) { Logger?.Debug($"[ServerCore] Cts already disposed: {ex.Message}"); }
         catch (Exception ex) { Logger?.Warn($"[ServerCore] 取消 CancellationTokenSource 失败: {ex.Message}"); }
 
         try
@@ -90,9 +99,9 @@ public sealed class ServerCore : IServerCore
                 _thread.Join(500);
             }
         }
-        catch
+        catch (Exception ex)
         {
-
+            Logger?.Debug($"[ServerCore] Thread join error: {ex.Message}");
         }
 
         NetManager.Stop();
@@ -136,28 +145,52 @@ public sealed class ServerCore : IServerCore
         }
     }
 
-        private void RegisterCoreEvents()
+    public bool ValidateConnection(LiteNetLib.Utils.NetDataReader? reader, out string? rejectionReason)
+    {
+        if (NetManager.PeersCount >= Options.MaxConnections)
+        {
+            rejectionReason = "MaxConnectionsReached";
+            return false;
+        }
+
+        string providedKey = reader != null && reader.AvailableBytes > 0 ? reader.GetString() : string.Empty;
+        if (!string.IsNullOrEmpty(Options.ConnectionKey))
+        {
+            if (!string.Equals(providedKey, Options.ConnectionKey, StringComparison.Ordinal))
+            {
+                rejectionReason = "InvalidKey";
+                return false;
+            }
+        }
+
+        if (reader == null || reader.AvailableBytes < 4)
+        {
+            rejectionReason = "MissingProtocolVersion";
+            return false;
+        }
+
+        int clientProtocolVersion = reader.GetInt();
+        if (clientProtocolVersion < NetworkConstants.ProtocolVersion)
+        {
+            rejectionReason = $"IncompatibleProtocolVersion:{clientProtocolVersion}";
+            return false;
+        }
+
+        rejectionReason = null;
+        return true;
+    }
+
+    private void RegisterCoreEvents()
     {
         Listener.ConnectionRequestEvent += request =>
         {
             try
             {
-                if (NetManager.PeersCount >= Options.MaxConnections)
+                if (!ValidateConnection(request.Data, out string? rejectionReason))
                 {
                     request.Reject();
-                    Logger.Warn("[ServerCore] Rejecting connection: max connections reached");
+                    Logger.Warn($"[ServerCore] Rejecting connection: {rejectionReason}");
                     return;
-                }
-
-                if (!string.IsNullOrEmpty(Options.ConnectionKey))
-                {
-                    string providedKey = request.Data.GetString();
-                    if (!string.Equals(providedKey, Options.ConnectionKey, StringComparison.Ordinal))
-                    {
-                        request.Reject();
-                        Logger.Warn("[ServerCore] Rejecting connection: invalid key");
-                        return;
-                    }
                 }
 
                 request.Accept();
@@ -166,7 +199,7 @@ public sealed class ServerCore : IServerCore
             {
                 Logger.Error(ex, "[ServerCore] Error handling connection request");
                 try { request.Reject(); }
-                catch (ObjectDisposedException) {  }
+                catch (ObjectDisposedException odEx) { Logger?.Debug($"[ServerCore] Request already disposed: {odEx.Message}"); }
                 catch (Exception rejectEx) { Logger?.Warn($"[ServerCore] 拒绝连接请求失败: {rejectEx.Message}"); }
             }
         };

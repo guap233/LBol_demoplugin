@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
@@ -127,6 +127,14 @@ public partial class NetworkServer
                 return true;
             }
 
+            if (!string.IsNullOrWhiteSpace(jsonPayload) && IsImpersonating(senderSession, jsonPayload, out string claimedId))
+            {
+                string warn = $"[安全拦截] 客户端 {senderSession?.PlayerId} 企图在 {messageType} 中冒充 {claimedId}，已拦截";
+                Plugin.Logger?.LogWarning(warn);
+                _logger?.LogWarning(warn);
+                return true;
+            }
+
             LogRouteProbeOnce($"HostRequest/{messageType}",
                 $"sender={senderSession?.PlayerId}, host={hostSession.PlayerId}");
 
@@ -140,6 +148,45 @@ public partial class NetworkServer
         }
     }
 
+    internal static bool IsImpersonating(PlayerSession senderSession, string jsonPayload, out string claimedId)
+    {
+        claimedId = string.Empty;
+        if (senderSession == null || string.IsNullOrWhiteSpace(senderSession.PlayerId))
+        {
+            return false;
+        }
+
+        try
+        {
+            using JsonDocument doc = JsonDocument.Parse(jsonPayload);
+            JsonElement root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            string[] senderIdProperties = { "RequesterPlayerId", "RequesterId", "PlayerId", "VoterId", "ClientPlayerId", "SenderPlayerId", "UploaderId", "OwnerPlayerId" };
+            foreach (string prop in senderIdProperties)
+            {
+                if (root.TryGetProperty(prop, out JsonElement el) && el.ValueKind == JsonValueKind.String)
+                {
+                    string val = el.GetString();
+                    if (!string.IsNullOrWhiteSpace(val) && !string.Equals(val, senderSession.PlayerId, StringComparison.Ordinal))
+                    {
+                        claimedId = val;
+                        return true;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger?.LogDebug($"[NetworkServer] IsImpersonating check failed: {ex.Message}");
+        }
+
+        return false;
+    }
+
         private void RouteRoomStateRequest(PlayerSession senderSession, string jsonPayload)
     {
         try
@@ -147,6 +194,14 @@ public partial class NetworkServer
             PlayerSession hostSession = GetConnectedHostSession();
             if (hostSession == null)
             {
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(jsonPayload) && IsImpersonating(senderSession, jsonPayload, out string claimedId))
+            {
+                string warn = $"[安全拦截] 客户端 {senderSession?.PlayerId} 企图在 RoomStateRequest 中冒充 {claimedId}，已拦截";
+                Plugin.Logger?.LogWarning(warn);
+                _logger?.LogWarning(warn);
                 return;
             }
 
@@ -168,6 +223,14 @@ public partial class NetworkServer
             PlayerSession hostSession = GetConnectedHostSession();
             if (hostSession == null)
             {
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(jsonPayload) && IsImpersonating(senderSession, jsonPayload, out string claimedId))
+            {
+                string warn = $"[安全拦截] 客户端 {senderSession?.PlayerId} 企图在 RoomStateUpload 中冒充 {claimedId}，已拦截";
+                Plugin.Logger?.LogWarning(warn);
+                _logger?.LogWarning(warn);
                 return;
             }
 

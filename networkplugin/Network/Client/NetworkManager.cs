@@ -4,6 +4,7 @@ using System.Text.Json;
 using NetworkPlugin.Network.NetworkPlayer;
 using NetworkPlugin.Network.Messages;
 using NetworkPlugin.Patch.Network;
+using NetworkPlugin.Core.Trade;
 using NetworkPlugin.Utils;
 
 namespace NetworkPlugin.Network.Client;
@@ -47,13 +48,14 @@ public class NetworkManager : INetworkManager
             GapOptionsSyncPatch.EnsureSubscribed(_networkClient);
 
             TradeSyncPatch.EnsureSubscribed(_networkClient);
+            TradeSettlementCoordinator.EnsureInitialized();
 
             _networkClient.OnGameEventReceived += OnGameEventReceived;
             _networkClient.OnConnectionStateChanged += OnConnectionStateChanged;
         }
-        catch
+        catch (Exception ex)
         {
-
+            Plugin.Logger?.LogWarning($"[NetworkManager] Subscription initialization error: {ex.Message}");
         }
     }
 
@@ -180,7 +182,7 @@ public class NetworkManager : INetworkManager
         _selfPlayer = player;
     }
 
-        internal void ClearAllPlayers()
+    public void ClearAllPlayers()
     {
         lock (_playersLock)
         {
@@ -242,6 +244,7 @@ public class NetworkManager : INetworkManager
 
             NetworkIdentityTracker.EnsureSubscribed(_networkClient);
             TradeSyncPatch.EnsureSubscribed(_networkClient);
+            TradeSettlementCoordinator.EnsureInitialized();
 
             HashSet<string> ids = NetworkIdentityTracker.GetPlayerIdsSnapshot();
 
@@ -385,29 +388,70 @@ public class NetworkManager : INetworkManager
         }
     }
 
-        private void UpdatePlayersFromArray(JsonElement playersArray)
+    internal void UpdatePlayersFromArray(JsonElement playersArray)
     {
         if (playersArray.ValueKind != JsonValueKind.Array)
         {
             return;
         }
 
+        HashSet<string> incomingOnlineIds = new(StringComparer.Ordinal);
+
         foreach (JsonElement p in playersArray.EnumerateArray())
         {
-            UpdateSinglePlayer(p);
+            string playerId = GetString(p, "PlayerId") ?? GetString(p, "Id");
+            if (string.IsNullOrWhiteSpace(playerId))
+            {
+                continue;
+            }
+
+            bool hasConnectedField = p.ValueKind == JsonValueKind.Object && p.TryGetProperty("IsConnected", out _);
+            bool isConnected = !hasConnectedField || GetBool(p, "IsConnected", true);
+
+            if (isConnected)
+            {
+                incomingOnlineIds.Add(playerId);
+                UpdateSinglePlayer(p);
+            }
+        }
+
+        lock (_playersLock)
+        {
+            List<string> toRemove = null;
+            foreach (string key in _players.Keys)
+            {
+                if (string.Equals(key, _selfKey, StringComparison.Ordinal) || string.Equals(key, "self", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (!incomingOnlineIds.Contains(key))
+                {
+                    (toRemove ??= new List<string>()).Add(key);
+                }
+            }
+
+            if (toRemove != null)
+            {
+                foreach (string key in toRemove)
+                {
+                    _players.Remove(key);
+                }
+                MarkPlayersDirty_NoLock();
+            }
         }
     }
 
         private void UpdateSinglePlayer(JsonElement playerObj)
     {
-        string playerId = GetString(playerObj, "PlayerId");
+        string playerId = GetString(playerObj, "PlayerId") ?? GetString(playerObj, "Id");
         if (string.IsNullOrWhiteSpace(playerId))
         {
             return;
         }
 
-        string playerName = GetString(playerObj, "PlayerName");
-        string characterId = GetString(playerObj, "CharacterId");
+        string playerName = GetString(playerObj, "PlayerName") ?? GetString(playerObj, "Name");
+        string characterId = GetString(playerObj, "CharacterId") ?? GetString(playerObj, "Chara");
 
         int locX = GetInt(playerObj, "LocationX", -1);
         int locY = GetInt(playerObj, "LocationY", -1);
@@ -592,7 +636,30 @@ public class NetworkManager : INetworkManager
         }
     }
 
-        private IEnumerable<INetworkPlayer> GetPlayersSnapshot()
+    private static bool GetBool(JsonElement elem, string property, bool defaultValue = false)
+    {
+        try
+        {
+            if (elem.ValueKind != JsonValueKind.Object || !elem.TryGetProperty(property, out JsonElement p))
+            {
+                return defaultValue;
+            }
+
+            return p.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                JsonValueKind.String => bool.TryParse(p.GetString(), out bool b) ? b : defaultValue,
+                _ => defaultValue,
+            };
+        }
+        catch
+        {
+            return defaultValue;
+        }
+    }
+
+    private IEnumerable<INetworkPlayer> GetPlayersSnapshot()
     {
         lock (_playersLock)
         {

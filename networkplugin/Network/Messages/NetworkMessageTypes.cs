@@ -193,6 +193,10 @@ namespace NetworkPlugin.Network.Messages
 
                 public const string OnTradePrepareResultRequest = "OnTradePrepareResultRequest";
 
+                public const string OnTradeCommitResultRequest = "OnTradeCommitResultRequest";
+
+                public const string OnTradeCompensationResultRequest = "OnTradeCompensationResultRequest";
+
                 public const string OnPlayerDeathStatusChanged = "OnPlayerDeathStatusChanged";
 
                 public const string OnResurrectRequest = "OnResurrectRequest";
@@ -326,21 +330,141 @@ namespace NetworkPlugin.Network.Messages
 
                 private static readonly HashSet<string> ExplicitGameEvents = new(StringComparer.Ordinal)
         {
+            // Cards & Decks
+            OnCardPlayStart,
+            OnCardPlayComplete,
+            OnCardDraw,
+            OnCardDiscard,
+            OnCardExile,
+            OnCardUpgrade,
+            OnCardRemove,
+            OnRemoteCardUse,
+            OnRemoteCardResolved,
+            CardStateChanged,
+            DeckOperation,
+            HandSyncRequest,
+            HandSyncResponse,
+            DeckSyncRequest,
+            DeckSyncResponse,
+            DiscardSyncRequest,
+            DiscardSyncResponse,
+
+            // Mana
+            ManaConsumeStarted,
+            ManaConsumeCompleted,
+            ManaRegain,
+            TurnManaCalculated,
+            MaxManaChange,
+
+            // Combat & Damage & Vitals
+            OnDamageDealt,
+            OnDamageReceived,
+            OnBlockGained,
+            OnShieldGained,
+            OnHealingReceived,
+            OnStatusEffectApplied,
+            OnStatusEffectRemoved,
+            OnMoodEffectLoopStarted,
+            OnMoodEffectLoopEnded,
+            OnMoodEffectStateSync,
+            OnPlayerStateUpdate,
+            OnEnemyAttackPlayerVisual,
+            BattlePlayerDamageReport,
+            BattlePlayerDamageBroadcast,
+            BattlePlayerHealReport,
+            BattlePlayerHealBroadcast,
+            BattlePlayerStatusEffectsDeltaReport,
+            BattlePlayerStatusEffectsDeltaBroadcast,
+            BattlePlayerStatusEffectsFullReport,
+            BattlePlayerStatusEffectsFullBroadcast,
+            BattlePlayerUsUsedReport,
+            BattlePlayerUsUsedBroadcast,
+            BattlePlayerCardUsedReport,
+            BattlePlayerCardUsedBroadcast,
+            OnTurnStart,
+            OnTurnEnd,
             EndTurnRequest,
             EndTurnStatus,
             EndTurnConfirm,
             "EndTurnCancel",
+            OnBattleStart,
+            OnBattleEnd,
             BattleEnemyIntentChanged,
             BattleEnemyStateChanged,
             BattleEnemySpawned,
             EnemyStateUpdate,
             EnemySpawned,
-            CardStateChanged,
-            GapOptionsUpgradeSelected,
-            GapOptionsRemoveCard,
+
+            // Map & Events & Voting
+            OnMapNodeEnter,
+            OnMapNodeComplete,
+            OnMapNodeMarkChanged,
+            OnMapNodeVoteCast,
+            OnMapNodeVoteResult,
+            OnEventStart,
+            OnEventSelection,
+            OnEventResult,
+            OnDialogText,
+            OnDialogOptions,
+            OnEventVoteCast,
+            OnEventVotingResult,
+            OnDebutBonusRolled,
+            OnBossRewardSelection,
+            OnShopEvent,
+            OnShopEnter,
+            OnShopExit,
+            OnShopPurchase,
+            OnTreasureEvent,
+
+            // Trade
+            OnTradeStartRequest,
+            OnTradeOfferUpdateRequest,
+            OnTradeConfirmRequest,
+            OnTradeCancelRequest,
+            OnTradeStateUpdate,
+            OnTradeSnapshotRequest,
+            OnTradePrepareResultRequest,
+            OnTradeCommitResultRequest,
+            OnTradeCompensationResultRequest,
+
+            // Death & Resurrect & Gap
+            OnPlayerDeathStatusChanged,
+            OnResurrectRequest,
+            OnResurrectFailed,
+            OnPlayerResurrected,
+            OnGapHealRequest,
+            OnGapHealFailed,
+            OnGapPlayerHealed,
             GapStationEntered,
             DrinkTeaStarted,
             DrinkTeaCompleted,
+            GapOptionsUpgradeSelected,
+            GapOptionsRemoveCard,
+
+            // Exhibits & Tools
+            OnExhibitObtained,
+            OnExhibitRemoved,
+            ExhibitActivationChanged,
+            ExhibitCounterChanged,
+            OnToolCardUsed,
+            OnToolCardObtained,
+            OnToolCardRemoved,
+            OnToolCardEffectApplied,
+
+            // Connection & Game Lifecycle
+            OnConnectionEstablished,
+            OnConnectionLost,
+            OnReconnectionAttempt,
+            OnGameStart,
+            OnGameEnd,
+            OnGameRunResult,
+            OnGameSave,
+            OnGameLoad,
+            OnError,
+            OnLobbyResumeGame,
+            OnLobbyResumeInfo,
+
+            // Chat
             ChatMessage,
         };
 
@@ -387,11 +511,21 @@ namespace NetworkPlugin.Network.Messages
             OnTradeCancelRequest,
             OnTradeSnapshotRequest,
             OnTradePrepareResultRequest,
+            OnTradeCommitResultRequest,
+            OnTradeCompensationResultRequest,
             OnResurrectRequest,
             OnGapHealRequest,
             OnMapNodeVoteCast,
             OnEventVoteCast,
             MidGameJoinRequest,
+            BattlePlayerCardUsedReport,
+            BattlePlayerUsUsedReport,
+            BattlePlayerDamageReport,
+            BattlePlayerHealReport,
+            BattlePlayerStatusEffectsDeltaReport,
+            BattlePlayerStatusEffectsFullReport,
+            EndTurnRequest,
+            "EndTurnCancel",
         };
 
                 public static bool IsHostRequest(string messageType)
@@ -406,12 +540,7 @@ namespace NetworkPlugin.Network.Messages
                 return false;
             }
 
-            if (ExplicitGameEvents.Contains(messageType) ||
-
-                messageType.StartsWith("On", StringComparison.Ordinal) ||
-                messageType.StartsWith("Mana", StringComparison.Ordinal) ||
-                messageType.StartsWith("Gap", StringComparison.Ordinal) ||
-                messageType.StartsWith("Battle", StringComparison.Ordinal))
+            if (ExplicitGameEvents.Contains(messageType))
             {
                 return true;
             }

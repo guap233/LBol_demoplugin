@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Microsoft.Extensions.DependencyInjection;
 using NetworkPlugin.Configuration;
+using NetworkPlugin.Network.Client;
 using NetworkPlugin.Utils;
 using UnityEngine;
 
@@ -462,6 +463,14 @@ public static partial class OtherPlayersOverlayPatch
         {
             return false;
         }
+
+        string selfId = _selfPlayerId ?? NetworkIdentityTracker.GetSelfPlayerId();
+        if (!string.IsNullOrWhiteSpace(selfId) && string.Equals(playerId, selfId, StringComparison.Ordinal))
+        {
+            INetworkClient client = TryGetNetworkClient();
+            return client?.IsConnected == true;
+        }
+
         lock (_syncLock)
         {
             if (_players.TryGetValue(playerId, out PlayerSummary p) && p != null)
@@ -469,7 +478,7 @@ public static partial class OtherPlayersOverlayPatch
                 return p.IsConnected;
             }
         }
-        return true;
+        return false;
     }
 
     #endregion

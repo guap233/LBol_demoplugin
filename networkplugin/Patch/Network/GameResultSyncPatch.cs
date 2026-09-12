@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Text.Json;
 using HarmonyLib;
 using LBoL.Core;
@@ -124,6 +124,12 @@ public static class GameResultSyncPatch
             return;
         }
 
+        if (NetworkIdentityTracker.GetSelfIsHost())
+        {
+            Plugin.Logger?.LogWarning("[GameResultSync] Host 收到远端 OnGameRunResult，直接忽略（Host 拥有权威发布权）");
+            return;
+        }
+
         if (!TryGetJsonElement(payload, out JsonElement root))
         {
             Plugin.Logger?.LogWarning("[GameResultSync] Received OnGameRunResult but payload is not JSON.");
@@ -181,13 +187,19 @@ public static class GameResultSyncPatch
         }
     }
 
-    private static void HandleLocalGameResult(GameResultType resultType)
+    internal static void HandleLocalGameResult(GameResultType resultType)
     {
         LastLocalResult = resultType;
 
         INetworkClient client = NetworkEventHelper.TryGetNetworkClient();
         if (client?.IsConnected != true)
         {
+            return;
+        }
+
+        if (!NetworkIdentityTracker.GetSelfIsHost())
+        {
+            Plugin.Logger?.LogWarning("[GameResultSync] 非 Host 成员尝试发布战斗结果，已拦截");
             return;
         }
 

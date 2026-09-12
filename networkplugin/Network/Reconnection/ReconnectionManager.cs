@@ -1,4 +1,4 @@
-﻿using LBoL.Core;
+using LBoL.Core;
 using LBoL.Core.Stations;
 using System;
 using System.Collections.Generic;
@@ -13,6 +13,7 @@ using NetworkPlugin.Network.Event;
 using NetworkPlugin.Network.Messages;
 using NetworkPlugin.Network.NetworkPlayer;
 using NetworkPlugin.Network.Snapshot;
+using NetworkPlugin.Network.Security;
 using NetworkPlugin.Utils;
 
 namespace NetworkPlugin.Network.Reconnection;
@@ -658,7 +659,8 @@ public sealed class ReconnectionManager : IDisposable
                 }
             }
 
-            if (!string.IsNullOrWhiteSpace(snapshot.ReconnectToken) &&
+            if (string.IsNullOrWhiteSpace(reconnectToken) ||
+                string.IsNullOrWhiteSpace(snapshot.ReconnectToken) ||
                 !string.Equals(snapshot.ReconnectToken, reconnectToken, StringComparison.Ordinal))
             {
                 return ReconnectionResult.Failed("Invalid reconnect token");
@@ -674,7 +676,10 @@ public sealed class ReconnectionManager : IDisposable
                 return ReconnectionResult.Failed("重连超时");
             }
 
-            LogInformation($"[ReconnectionManager] 已批准玩家重连: playerId={playerId}");
+            string oldToken = snapshot.ReconnectToken;
+            string newToken = GenerateReconnectToken();
+            snapshot.ReconnectToken = newToken;
+            LogInformation($"[ReconnectionManager] 已批准玩家重连并轮换令牌: playerId={playerId}, oldToken={SecurityUtils.MaskToken(oldToken)}, newToken={SecurityUtils.MaskToken(newToken)}");
 
             SendReconnectionSnapshot(playerId, snapshot);
             NotifyPlayerReconnected(playerId);
@@ -771,13 +776,7 @@ public sealed class ReconnectionManager : IDisposable
 
         private string GenerateReconnectToken()
     {
-        byte[] bytes = new byte[32];
-        using (RandomNumberGenerator rng = RandomNumberGenerator.Create())
-        {
-            rng.GetBytes(bytes);
-        }
-
-        return BitConverter.ToString(bytes).Replace("-", string.Empty).ToLowerInvariant();
+        return SecurityUtils.GenerateReconnectToken();
     }
 
         private void RemovePlayerSnapshot(string playerId)
@@ -982,6 +981,14 @@ public sealed class ReconnectionManager : IDisposable
     {
         _logger?.LogDebug(message);
         _fallbackLogger?.LogDebug(message);
+    }
+
+    internal void SetPlayerSnapshotForTest(string playerId, PlayerStateSnapshot snapshot)
+    {
+        lock (_syncLock)
+        {
+            _playerSnapshots[playerId] = snapshot;
+        }
     }
 
     #endregion

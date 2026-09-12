@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -23,6 +23,7 @@ using NetworkPlugin.UI.Payloads;
 using NetworkPlugin.UI.Rules;
 using NetworkPlugin.UI.Widgets;
 using NetworkPlugin.Utils;
+using NetworkPlugin.Core.Trade;
 using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -138,6 +139,7 @@ public partial class TradePanel : UiPanel<TradePayload>, IInputActionHandler
 
     private GameObject _cardPickerRoot;
     private bool _cardPickerApplyingSelection;
+    private bool _cardSelectionCompleted;
     private TextMeshProUGUI _cardCountText;
 
     private GameObject _offerPreviewRoot;
@@ -288,8 +290,18 @@ public partial class TradePanel : UiPanel<TradePayload>, IInputActionHandler
 
         if (_actionHandlerPushed)
         {
-            UiManager.PopActionHandler(this);
-            _actionHandlerPushed = false;
+            try
+            {
+                UiManager.PopActionHandler(this);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger?.LogWarning($"[TradePanel] PopActionHandler 异常: {ex.Message}");
+            }
+            finally
+            {
+                _actionHandlerPushed = false;
+            }
         }
 
         TryUnsubscribeTradeEvents();
@@ -400,6 +412,7 @@ public partial class TradePanel : UiPanel<TradePayload>, IInputActionHandler
             _partnerPickerAutoRefreshCo = null;
         }
         _cardPickerRoot?.SetActive(false);
+        _cardSelectionCompleted = false;
         _exhibitPickerRoot?.SetActive(false);
         _offerEditorRoot?.SetActive(false);
         _offerActionsRoot?.SetActive(false);
@@ -518,6 +531,21 @@ public partial class TradePanel : UiPanel<TradePayload>, IInputActionHandler
             confirmButton.button.interactable = true;
         }
 
+        var state = TradeSyncPatch.GetLastKnown(_tradeId);
+        if (state != null && state.Status == TradeSyncPatch.TradeStatus.Open &&
+            (!string.IsNullOrWhiteSpace(state.FailureCode) || !string.IsNullOrWhiteSpace(state.Reason)))
+        {
+            if (IsDuplicateExhibitResolvedLocally(state))
+            {
+                // 本地已主动移除冲突展品，解除陈旧错误显示
+            }
+            else
+            {
+                UpdateUIStatus(FormatFailureReason(state, _selfPlayerId));
+                return;
+            }
+        }
+
         if (hasAnyOffer)
         {
             UpdateUIStatus(TryLocalize("Trade.ReadyToConfirm", "可以确认交易"));
@@ -526,6 +554,57 @@ public partial class TradePanel : UiPanel<TradePayload>, IInputActionHandler
         {
             UpdateUIStatus(TryLocalize("Trade.WaitingForItems", "等待放入物品..."));
         }
+    }
+
+    private bool IsDuplicateExhibitResolvedLocally(TradeSyncPatch.TradeSessionState state)
+        => IsDuplicateExhibitResolved(state, _selfPlayerId, _localExhibitOfferIds);
+
+    internal static bool IsDuplicateExhibitResolved(
+        TradeSyncPatch.TradeSessionState state,
+        string localPlayerId,
+        ICollection<string> currentLocalExhibitOfferIds)
+    {
+        if (state == null || !MatchesCode(state, TradeFailureCodes.DuplicateExhibit))
+        {
+            return false;
+        }
+
+        string conflictExhibitId = state.ConflictExhibitId;
+        if (string.IsNullOrWhiteSpace(conflictExhibitId) && !string.IsNullOrWhiteSpace(state.Reason))
+        {
+            int colonIdx = state.Reason.LastIndexOf(':');
+            if (colonIdx >= 0 && colonIdx < state.Reason.Length - 1)
+            {
+                string candidate = state.Reason.Substring(colonIdx + 1).Trim();
+                if (!string.IsNullOrWhiteSpace(candidate) &&
+                    !string.Equals(candidate, TradeFailureCodes.DuplicateExhibit, StringComparison.OrdinalIgnoreCase))
+                {
+                    conflictExhibitId = candidate;
+                }
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(conflictExhibitId))
+        {
+            return false;
+        }
+
+        string selfId = localPlayerId ?? NetworkIdentityTracker.GetSelfPlayerId();
+        if (string.IsNullOrWhiteSpace(selfId))
+        {
+            return false;
+        }
+
+        bool localIsA = string.Equals(selfId, state.PlayerAId, StringComparison.OrdinalIgnoreCase);
+        bool localOfferedPreviously = (localIsA ? state.ExhibitsA : state.ExhibitsB)?
+            .Any(e => string.Equals(e?.ExhibitId, conflictExhibitId, StringComparison.OrdinalIgnoreCase)) == true;
+
+        if (localOfferedPreviously && (currentLocalExhibitOfferIds == null || !currentLocalExhibitOfferIds.Contains(conflictExhibitId)))
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private static bool HasOffer(TradeSyncPatch.TradeSessionState state, bool isOfferA)
@@ -569,9 +648,25 @@ public partial class TradePanel : UiPanel<TradePayload>, IInputActionHandler
                 return;
             }
 
-            UpdateUIStatus(remoteConfirmed
-                ? TryLocalize("Trade.BothConfirmed", "双方已确认，准备交换...")
-                : TryLocalize("Trade.WaitingForPartner", "已确认交易，等待对方确认..."));
+            if (!string.IsNullOrWhiteSpace(state.FailureCode) || !string.IsNullOrWhiteSpace(state.Reason))
+            {
+                if (!IsDuplicateExhibitResolvedLocally(state))
+                {
+                    UpdateUIStatus(FormatFailureReason(state, _selfPlayerId));
+                }
+                else
+                {
+                    UpdateUIStatus(remoteConfirmed
+                        ? TryLocalize("Trade.BothConfirmed", "双方已确认，准备交换...")
+                        : TryLocalize("Trade.WaitingForPartner", "已确认交易，等待对方确认..."));
+                }
+            }
+            else
+            {
+                UpdateUIStatus(remoteConfirmed
+                    ? TryLocalize("Trade.BothConfirmed", "双方已确认，准备交换...")
+                    : TryLocalize("Trade.WaitingForPartner", "已确认交易，等待对方确认..."));
+            }
 
             TradeSyncPatch.RequestConfirm(_tradeId, _selfPlayerId);
             return;
@@ -599,6 +694,12 @@ public partial class TradePanel : UiPanel<TradePayload>, IInputActionHandler
 
     public void OnCancel()
     {
+        if (_exhibitPickerRoot is not null && _exhibitPickerRoot.activeSelf)
+        {
+            HideExhibitPickerOverlay(false);
+            return;
+        }
+
         if (_cardPickerRoot is not null && _cardPickerRoot.activeSelf)
         {
             HideCardPickerOverlay();
@@ -617,21 +718,13 @@ public partial class TradePanel : UiPanel<TradePayload>, IInputActionHandler
 
     private IEnumerator ExecuteTrade()
     {
-        GameRunController run = ActiveGameRun;
-
         if (TryIsNetworkTrade(out _))
         {
-            bool isA = string.Equals(_selfPlayerId, _playerAId, StringComparison.Ordinal);
-            yield return ApplyNetworkTradeAndClose(isA);
             yield break;
         }
 
-        if (run is null)
-        {
-            UpdateUIStatus("Trade.Failed".Localize());
-            Plugin.Logger?.LogWarning("[TradePanel] ExecuteTrade aborted: ActiveGameRun is null.");
-            yield break;
-        }
+        ITradeInventory inventory = ModService.ServiceProvider?.GetService<ITradeInventory>()
+            ?? new GameRunTradeInventory();
 
         if (confirmButton?.button is not null)
         {
@@ -642,22 +735,35 @@ public partial class TradePanel : UiPanel<TradePayload>, IInputActionHandler
             cancelButton.button.interactable = false;
         }
 
-        _player1OfferedCards.ForEach(card =>
+        var plan = new TradeSettlementPlan
         {
-            run.RemoveDeckCard(card, false);
-            run.AddDeckCard(card, true, new VisualSourceData
+            TradeId = "local_mock",
+            CommitId = Guid.NewGuid().ToString("N"),
+            LocalPlayerId = _selfPlayerId ?? "local",
+            SpentCards = _player1OfferedCards.Where(c => c != null).Select(c => new TradeCardItem
             {
-                SourceType = VisualSourceType.CardSelect
-            });
-        });
+                CardId = c.Id,
+                InstanceId = c.InstanceId,
+                IsUpgraded = c.IsUpgraded,
+                UpgradeCounter = c.UpgradeCounter ?? 0,
+                CardName = c.Name
+            }).ToList(),
+            GainedCards = _player2OfferedCards.Where(c => c != null).Select(c => new TradeCardItem
+            {
+                CardId = c.Id,
+                InstanceId = -1,
+                IsUpgraded = c.IsUpgraded,
+                UpgradeCounter = c.UpgradeCounter ?? 0,
+                CardName = c.Name
+            }).ToList()
+        };
 
-        _player2OfferedCards.ForEach(card =>
+        var result = inventory.ApplyPlan(plan);
+        if (result == null || !result.Success)
         {
-            run.AddDeckCard(card, true, new VisualSourceData
-            {
-                SourceType = VisualSourceType.CardSelect
-            });
-        });
+            UpdateUIStatus("Trade.Failed".Localize());
+            yield break;
+        }
 
         UpdateUIStatus("Trade.Completed".Localize());
 

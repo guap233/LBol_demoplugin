@@ -1,6 +1,7 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using LiteNetLib;
+using NetworkPlugin.Network.Security;
 
 namespace NetworkPlugin.Network.Server;
 
@@ -42,7 +43,7 @@ public class PlayerSession
 
     #region 便捷属性与方法
 
-        public string RemoteEndPoint => Peer.EndPoint?.ToString() ?? "unknown";
+        public string RemoteEndPoint => Peer?.EndPoint?.ToString() ?? "unknown";
 
         public bool IsTimeout(int timeoutSeconds = 30)
     {
@@ -57,6 +58,28 @@ public class PlayerSession
         public void UpdateMessageTime()
     {
         LastMessageAt = DateTime.UtcNow;
+    }
+
+        public string SessionNonce { get; set; } = string.Empty;
+
+        public ReplayGuard ReplayGuard { get; } = new();
+
+        public ConnectionRateLimiter RateLimiter { get; } = new();
+
+        public AuthenticatedSender ToAuthenticatedSender()
+    {
+        string nonce = !string.IsNullOrEmpty(SessionNonce)
+            ? SessionNonce
+            : (Metadata != null && Metadata.TryGetValue("SessionNonce", out var n)
+                ? n?.ToString() ?? string.Empty
+                : string.Empty);
+
+        return new AuthenticatedSender(
+            connectionId: Peer?.Id ?? -1,
+            playerId: PlayerId,
+            roomId: CurrentRoomId,
+            isHost: IsHost,
+            sessionNonce: nonce);
     }
 
     #endregion

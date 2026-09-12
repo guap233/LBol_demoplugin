@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -100,13 +100,19 @@ private void EnsureCardPickerOverlay()
             if (tag.ReturnButton is not null)
             {
                 tag.ReturnButton.onClick.RemoveAllListeners();
-                tag.ReturnButton.onClick.AddListener(HideCardPickerOverlay);
+                tag.ReturnButton.onClick.AddListener(() => ApplyCardPickerSelection(tag));
+                var label = tag.ReturnButton.GetComponentInChildren<TextMeshProUGUI>(true);
+                if (label is not null)
+                {
+                    var localized = label.GetComponent<LBoL.Presentation.I10N.LocalizedText>();
+                    if (localized is not null) localized.enabled = false;
+                    label.text = "确认选择";
+                }
             }
 
             if (tag.TopHideButton != null)
             {
                 tag.TopHideButton.onClick.RemoveAllListeners();
-                tag.TopHideButton.onClick.AddListener(HideCardPickerOverlay);
                 tag.TopHideButton.onClick.AddListener(HideCardPickerOverlay);
             }
 
@@ -226,7 +232,7 @@ private void EnsureCardPickerOverlay()
         public GameObject SelectParticleTemplate;
         public readonly List<Card> SourceCards = new();
         public readonly List<SelectCardWidget> SelectWidgets = new();
-        public readonly List<int> SelectIndexOrder = new();
+        public readonly List<Card> SelectedCards = new();
         public int TargetSelectCount;
         public CardPickerOrderStatus CurrentOrder = CardPickerOrderStatus.Actual;
         public CardPickerFilterStatus CurrentFilter = CardPickerFilterStatus.AllCards;
@@ -234,6 +240,11 @@ private void EnsureCardPickerOverlay()
 
     private void ShowCardPickerOverlay()
     {
+        if (!CanEditOffer() || _cardSelectionCompleted)
+        {
+            TryShowTopMessage("本次交易已完成选牌；如需交易其他卡牌，请发起新的交易。");
+            return;
+        }
         GameRunController run = ActiveGameRun;
         Plugin.Logger?.LogInfo($"[TradePanel] ShowCardPickerOverlay enter: tradeId={_tradeId ?? "<null>"}, cardPickerExists={(_cardPickerRoot is not null)}, activeGameRun={(run is not null)}, deckCount={(run?.BaseDeck?.Count ?? 0)}, offeredLocal={_player1OfferedCards.Count}, maxSlots={_maxTradeSlots}, canEdit={CanEditOffer()}");
         EnsureCardPickerOverlay();
@@ -247,6 +258,7 @@ private void EnsureCardPickerOverlay()
         CardPickerTag tag = _cardPickerRoot.GetComponent<CardPickerTag>();
         if (tag is not null)
         {
+            tag.SelectedCards.Clear();
             tag.CurrentOrder = CardPickerOrderStatus.Actual;
             tag.CurrentFilter = CardPickerFilterStatus.AllCards;
         }
@@ -265,7 +277,7 @@ private void EnsureCardPickerOverlay()
         if (tag?.DeckHolder is not null)
         {
             tag.SelectWidgets.Clear();
-            tag.SelectIndexOrder.Clear();
+            tag.SelectedCards.Clear();
             tag.DeckHolder.Clear();
         }
 
@@ -584,7 +596,6 @@ private void EnsureCardPickerOverlay()
 
         tag.DeckHolder.Clear();
         tag.SelectWidgets.Clear();
-        tag.SelectIndexOrder.Clear();
 
         int dreamCount = tag.SourceCards.Count(c => c is not null && c.IsDreamCard);
         int followCount = tag.SourceCards.Count(c => c is not null && c.IsFollowCard);
@@ -599,9 +610,7 @@ private void EnsureCardPickerOverlay()
         }
 
         List<Card> displayCards = GetCardPickerDisplayCards(tag);
-        string description = tag.TargetSelectCount == 3
-            ? "请选择3张牌交易"
-            : $"请选择{tag.TargetSelectCount}张牌交易";
+        string description = $"可选择0～{tag.TargetSelectCount}张牌交易，选好后点击确认选择";
 
         if (displayCards.Count == 0)
         {
@@ -674,6 +683,7 @@ private void EnsureCardPickerOverlay()
             selectWidget.SelectParticle = CreateCardPickerSelectionMarker(selectWidget.transform, tag.SelectParticleTemplate);
             selectWidget.SelectParticle.SetActive(false);
             selectWidget.SelectedChanged += (_, _) => OnCardPickerSelectionChanged(tag, selectWidget);
+            selectWidget.SetSelected(tag.SelectedCards.Contains(card), false);
             tag.SelectWidgets.Add(selectWidget);
         }
         catch
@@ -712,50 +722,34 @@ private void EnsureCardPickerOverlay()
             return;
         }
 
-        int widgetIndex = tag.SelectWidgets.IndexOf(widget);
-        if (widgetIndex < 0)
+        if (!tag.SelectWidgets.Contains(widget))
         {
             return;
         }
 
         if (widget.IsSelected)
         {
-            if (!tag.SelectIndexOrder.Contains(widgetIndex))
+            if (!tag.SelectedCards.Contains(widget.Card))
             {
-                tag.SelectIndexOrder.Add(widgetIndex);
+                tag.SelectedCards.Add(widget.Card);
             }
         }
         else
         {
-            tag.SelectIndexOrder.Remove(widgetIndex);
+            tag.SelectedCards.Remove(widget.Card);
         }
 
-        int selectedCount = tag.SelectWidgets.Count(w => w is not null && w.IsSelected);
-        if (selectedCount > tag.TargetSelectCount && tag.SelectIndexOrder.Count > 0)
+        if (tag.SelectedCards.Count > tag.TargetSelectCount)
         {
-            int firstIndex = tag.SelectIndexOrder[0];
-            tag.SelectIndexOrder.RemoveAt(0);
-            if (firstIndex >= 0 && firstIndex < tag.SelectWidgets.Count)
-            {
-                SelectCardWidget firstWidget = tag.SelectWidgets[firstIndex];
-                if (firstWidget is not null)
-                {
-                    firstWidget.SetSelected(false, false);
-                }
-            }
-
-            selectedCount = tag.SelectWidgets.Count(w => w is not null && w.IsSelected);
+            tag.SelectedCards.Remove(widget.Card);
+            widget.SetSelected(false, false);
         }
 
-        if (selectedCount >= tag.TargetSelectCount)
-        {
-            ApplyCardPickerSelection(tag);
-        }
     }
 
     private void ApplyCardPickerSelection(CardPickerTag tag)
     {
-        if (tag is null || _cardPickerApplyingSelection)
+        if (tag is null || _cardPickerApplyingSelection || _cardSelectionCompleted || !CanEditOffer())
         {
             return;
         }
@@ -763,22 +757,16 @@ private void EnsureCardPickerOverlay()
         _cardPickerApplyingSelection = true;
         try
         {
-            foreach (int index in tag.SelectIndexOrder.ToList())
+            using (new ApplyingStateScope(this))
             {
-                if (index < 0 || index >= tag.SelectWidgets.Count)
+                foreach (Card card in tag.SelectedCards.ToList())
                 {
-                    continue;
+                    AddCardToTrade(card, true);
                 }
-
-                SelectCardWidget widget = tag.SelectWidgets[index];
-                if (widget is null || !widget.IsSelected || widget.Card is null)
-                {
-                    continue;
-                }
-
-                AddCardToTrade(widget.Card, true);
             }
 
+            _cardSelectionCompleted = true;
+            TrySendOfferUpdate();
             RefreshOfferEditorTexts();
             CheckTradeReady();
             HideCardPickerOverlay();
@@ -804,7 +792,7 @@ private void EnsureCardPickerOverlay()
             return false;
         }
 
-        localIsA = string.Equals(_selfPlayerId, _playerAId, StringComparison.Ordinal);
+        localIsA = string.Equals(_selfPlayerId, _playerAId, StringComparison.OrdinalIgnoreCase);
         return !string.IsNullOrWhiteSpace(_tradeId) && !string.IsNullOrWhiteSpace(_selfPlayerId);
     }
 }

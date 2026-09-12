@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using HarmonyLib;
 using LBoL.Core;
@@ -10,6 +10,7 @@ using NetworkPlugin.Network.Client;
 using NetworkPlugin.Network.MidGameJoin;
 using NetworkPlugin.Network.Snapshot;
 using NetworkPlugin.Patch.Network;
+using NetworkPlugin.Patch.UI;
 using NetworkPlugin.Utils;
 
 namespace NetworkPlugin.Patch.MidGameJoin;
@@ -60,6 +61,8 @@ public static class JoinerStartGameLockPatch
     {
         try
         {
+            MainMenuMultiplayerEntryPatch.HideRoomListOverlay(immediate: true);
+
             INetworkClient client = TryGetClient();
             if (client == null || !client.IsConnected)
             {

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Net;
 using NetworkPlugin.Network.Messages;
 using NetworkPlugin.Network.NetworkPlayer;
@@ -18,6 +18,8 @@ public interface INetworkClient
         void PollEvents();
 
         void Stop();
+
+        void ClearSessionCredentials();
 
         bool IsConnected { get; }
 

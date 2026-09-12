@@ -196,7 +196,8 @@ public class MapPanelUpdateMapNodesStatusPatch
             }
 
             string characterId = null;
-            try { characterId = GameStateUtils.GetCurrentPlayer()?.ModelName; } catch { }
+            try { characterId = GameStateUtils.GetCurrentPlayer()?.ModelName; }
+            catch (Exception ex) { Plugin.Logger?.LogDebug($"[MapPanelUpdateMapNodesStatusPatch] GetCurrentPlayer error: {ex.Message}"); }
 
             var localPlayer = GameStateUtils.GetCurrentPlayer();
             var locationData = new

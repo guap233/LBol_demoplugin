@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Text.Json;
@@ -33,13 +33,27 @@ public static class BattleReportForwardPatch
 		    && eventType.StartsWith("BattlePlayer", StringComparison.Ordinal);
 	}
 
-	private static bool TryReserveForwardKey(string eventType, string playerId, string targetId, long timestamp)
+	private static bool TryReserveForwardKey(string eventType, string playerId, string targetId, long timestamp, string playId, int actionIndex)
 	{
-		string key = $"{eventType}|{playerId}|{targetId}";
+		string key;
+		if (!string.IsNullOrEmpty(playId))
+		{
+			key = $"{eventType}|{playerId}|{playId}|{actionIndex}";
+		}
+		else
+		{
+			string suffix = actionIndex >= 0 ? actionIndex.ToString() : timestamp.ToString();
+			key = $"{eventType}|{playerId}|{targetId}|{suffix}";
+		}
 
 		lock (SyncLock)
 		{
-			if (_lastForwardedTicksByKey.TryGetValue(key, out long lastTimestamp) && lastTimestamp == timestamp)
+			if (_lastForwardedTicksByKey.TryGetValue(key, out long lastTimestamp) && lastTimestamp == timestamp && string.IsNullOrEmpty(playId))
+			{
+				return false;
+			}
+
+			if (!string.IsNullOrEmpty(playId) && _lastForwardedTicksByKey.ContainsKey(key))
 			{
 				return false;
 			}
@@ -164,6 +178,8 @@ public static class BattleReportForwardPatch
 		long timestamp = 0;
 		string playerId = string.Empty;
 		string targetId = string.Empty;
+		string playId = string.Empty;
+		int actionIndex = -1;
 		if (root.ValueKind == JsonValueKind.Object)
 		{
 			if (root.TryGetProperty("Timestamp", out JsonElement timestampElement))
@@ -187,9 +203,19 @@ public static class BattleReportForwardPatch
 			{
 				targetId = targetElement.GetString() ?? string.Empty;
 			}
+
+			if (root.TryGetProperty("PlayId", out JsonElement playElement) && playElement.ValueKind == JsonValueKind.String)
+			{
+				playId = playElement.GetString() ?? string.Empty;
+			}
+
+			if (root.TryGetProperty("ActionIndex", out JsonElement indexElement) && indexElement.ValueKind == JsonValueKind.Number)
+			{
+				indexElement.TryGetInt32(out actionIndex);
+			}
 		}
 
-		if (!TryReserveForwardKey(eventType, playerId, targetId, timestamp))
+		if (!TryReserveForwardKey(eventType, playerId, targetId, timestamp, playId, actionIndex))
 		{
 			return;
 		}

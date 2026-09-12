@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -271,13 +271,13 @@ public sealed partial class TradePanel
 
             if (scaffold.ConfirmButton is not null)
             {
-                scaffold.ConfirmButton.onClick.RemoveAllListeners();
+                scaffold.ConfirmButton.onClick = new Button.ButtonClickedEvent();
                 scaffold.ConfirmButton.onClick.AddListener(() => HideExhibitPickerOverlay(true));
             }
 
             if (scaffold.CancelButton is not null)
             {
-                scaffold.CancelButton.onClick.RemoveAllListeners();
+                scaffold.CancelButton.onClick = new Button.ButtonClickedEvent();
                 scaffold.CancelButton.onClick.AddListener(() => HideExhibitPickerOverlay(false));
             }
 
@@ -404,7 +404,7 @@ public sealed partial class TradePanel
                 return;
             }
 
-            row.Button.onClick.RemoveAllListeners();
+            row.Button.onClick = new Button.ButtonClickedEvent();
             row.Button.onClick.AddListener(() =>
             {
                 bool nowSelected = !_localExhibitOfferIds.Contains(exhibit.Id);

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using LiteNetLib;
 
 namespace NetworkPlugin.Network.Server.Core;
@@ -20,4 +20,5 @@ public interface IServerCore
     void PollEvents();
     void MarkPeerSeen(NetPeer peer);
     bool TryGetSession(NetPeer peer, out CorePeerSession? session);
+    bool ValidateConnection(LiteNetLib.Utils.NetDataReader? reader, out string? rejectionReason);
 }

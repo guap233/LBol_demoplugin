@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using LiteNetLib;
 using LiteNetLib.Utils;
 using NetworkPlugin.Network.Room;
@@ -61,10 +61,17 @@ public class NetworkConnection
             return;
         }
 
-        NetDataWriter writer = new();
-        writer.Put(message.Type);
-        writer.Put(payloadJson);
-        Peer.Send(writer, deliveryMethod);
+        try
+        {
+            NetDataWriter writer = new();
+            writer.Put(message.Type);
+            writer.Put(payloadJson);
+            Peer.Send(writer, deliveryMethod);
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger?.LogDebug($"[NetworkConnection] Send message failed: {ex.Message}");
+        }
     }
 
     #endregion

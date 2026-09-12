@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Text.Json;
 using HarmonyLib;
@@ -35,9 +35,10 @@ public static class EndTurnSyncPatch
 
     private static bool _localEndedTurn;
     private static bool _allowEndTurn;
+    private static int _localSeq = 0;
     private static readonly HashSet<string> _endedPlayers = new(StringComparer.Ordinal);
-    private static string _pendingBattleId;
-    private static int _pendingRound = -1;
+    private static string _currentBattleId;
+    private static int _currentRound = -1;
     private static string _lastConfirmedBattleId;
     private static int _lastConfirmedRound = -1;
 
@@ -46,6 +47,14 @@ public static class EndTurnSyncPatch
     private static long _pendingProceedStartUtcTicks;
     private static int _pendingProceedAttempts;
     private const int PendingProceedTimeoutMs = 2500;
+
+    // Host 仲裁模式状态
+    private static bool _hostRoundConfirmed;
+    private static readonly HashSet<string> _hostReadyPlayers = new(StringComparer.Ordinal);
+    private static readonly Dictionary<string, int> _playerLastSeq = new(StringComparer.Ordinal);
+
+    // 跨回合请求暂存：针对未来的请求 (Round > currentRound)，存入暂存字典，不得在回合初始化时清除
+    private static readonly Dictionary<(string battleId, int round), HashSet<string>> _futureRoundReadyPlayers = new();
 
     public static bool LocalEndedTurn
     {
@@ -65,10 +74,36 @@ public static class EndTurnSyncPatch
             _endedPlayers.Clear();
             _localEndedTurn = false;
             _allowEndTurn = false;
-            _pendingBattleId = null;
-            _pendingRound = -1;
-            _lastConfirmedBattleId = null;
-            _lastConfirmedRound = -1;
+            _hostRoundConfirmed = false;
+            _hostReadyPlayers.Clear();
+            _playerLastSeq.Clear();
+            _pendingProceedBattleId = null;
+            _pendingProceedRound = -1;
+            _pendingProceedStartUtcTicks = 0;
+            _pendingProceedAttempts = 0;
+
+            // 导入此前暂存的该 (BattleId, Round) 的未来请求
+            if (!string.IsNullOrEmpty(_currentBattleId) && _currentRound >= 0)
+            {
+                var key = (_currentBattleId, _currentRound);
+                if (_futureRoundReadyPlayers.TryGetValue(key, out var stashed))
+                {
+                    foreach (var pid in stashed)
+                    {
+                        if (_activePlayerIds.Contains(pid))
+                        {
+                            _hostReadyPlayers.Add(pid);
+                            _endedPlayers.Add(pid);
+                        }
+                    }
+                    _futureRoundReadyPlayers.Remove(key);
+                }
+            }
+        }
+
+        if (IsSelfHost())
+        {
+            CheckAllPlayersEndedOnHost();
         }
     }
 
@@ -189,6 +224,12 @@ public static class EndTurnSyncPatch
             case "EndTurnCancel":
                 HandleEndTurnCancel(root);
                 return;
+            case NetworkMessageTypes.EndTurnStatus:
+                HandleEndTurnStatus(root);
+                return;
+            case NetworkMessageTypes.EndTurnConfirm:
+                HandleEndTurnConfirm(root);
+                return;
         }
     }
 
@@ -288,6 +329,12 @@ public static class EndTurnSyncPatch
         {
             _activePlayerIds = activeIds;
             _endedPlayers.RemoveWhere(pid => !activeIds.Contains(pid));
+            _hostReadyPlayers.RemoveWhere(pid => !activeIds.Contains(pid));
+        }
+
+        if (IsSelfHost())
+        {
+            CheckAllPlayersEndedOnHost();
         }
     }
 
@@ -323,81 +370,300 @@ public static class EndTurnSyncPatch
         {
             _activePlayerIds.Remove(id);
             _endedPlayers.Remove(id);
+            _hostReadyPlayers.Remove(id);
+            _playerLastSeq.Remove(id);
+        }
+
+        if (IsSelfHost())
+        {
+            CheckAllPlayersEndedOnHost();
         }
     }
 
     private static void HandleEndTurnRequest(JsonElement root)
     {
+        if (!IsSelfHost())
+        {
+            return;
+        }
+
         string playerId = GetString(root, "PlayerId");
         if (string.IsNullOrWhiteSpace(playerId))
         {
             return;
         }
 
+        string battleId = GetString(root, "BattleId") ?? "battle";
+        int round = GetInt(root, "Round", -1);
+        int seq = GetInt(root, "Seq", 0);
+
         lock (_syncLock)
         {
+            if (!_activePlayerIds.Contains(playerId))
+            {
+                return;
+            }
+
+            if (_playerLastSeq.TryGetValue(playerId, out int lastSeq) && seq <= lastSeq)
+            {
+                Plugin.Logger?.LogWarning($"[EndTurnSync] 丢弃过时/重复的 EndTurnRequest ({playerId}): seq={seq} <= lastSeq={lastSeq}");
+                return;
+            }
+            _playerLastSeq[playerId] = seq;
+
+            int currentRound = _currentRound;
+            if (round > currentRound)
+            {
+                var key = (battleId, round);
+                if (!_futureRoundReadyPlayers.TryGetValue(key, out var set))
+                {
+                    set = new HashSet<string>(StringComparer.Ordinal);
+                    _futureRoundReadyPlayers[key] = set;
+                }
+                set.Add(playerId);
+                Plugin.Logger?.LogInfo($"[EndTurnSync] 暂存来自 {playerId} 的未来回合请求 (Round={round}, CurrentRound={currentRound})");
+                return;
+            }
+
+            if (round < currentRound && currentRound >= 0)
+            {
+                Plugin.Logger?.LogInfo($"[EndTurnSync] 忽略过去回合请求 (Round={round}, CurrentRound={currentRound}) 来自 {playerId}");
+                return;
+            }
+
+            if (_hostRoundConfirmed)
+            {
+                Plugin.Logger?.LogInfo($"[EndTurnSync] 当前回合已裁定锁定，忽略来自 {playerId} 的 EndTurnRequest");
+                return;
+            }
+
+            _hostReadyPlayers.Add(playerId);
             _endedPlayers.Add(playerId);
         }
 
-        CheckAllPlayersEnded();
+        CheckAllPlayersEndedOnHost();
     }
 
     private static void HandleEndTurnCancel(JsonElement root)
     {
+        if (!IsSelfHost())
+        {
+            return;
+        }
+
         string playerId = GetString(root, "PlayerId");
         if (string.IsNullOrWhiteSpace(playerId))
         {
             return;
         }
 
+        string battleId = GetString(root, "BattleId") ?? "battle";
+        int round = GetInt(root, "Round", -1);
+        int seq = GetInt(root, "Seq", 0);
+
+        bool changed = false;
         lock (_syncLock)
         {
+            if (_playerLastSeq.TryGetValue(playerId, out int lastSeq) && seq <= lastSeq)
+            {
+                return;
+            }
+            _playerLastSeq[playerId] = seq;
+
+            int currentRound = _currentRound;
+            if (round > currentRound)
+            {
+                var key = (battleId, round);
+                if (_futureRoundReadyPlayers.TryGetValue(key, out var set))
+                {
+                    set.Remove(playerId);
+                }
+                return;
+            }
+
+            if (round < currentRound && currentRound >= 0)
+            {
+                return;
+            }
+
+            if (_hostRoundConfirmed)
+            {
+                Plugin.Logger?.LogInfo($"[EndTurnSync] 当前回合已裁定锁定，丢弃来自 {playerId} 迟到的 EndTurnCancel");
+                return;
+            }
+
+            changed = _hostReadyPlayers.Remove(playerId);
             _endedPlayers.Remove(playerId);
+        }
+
+        if (changed)
+        {
+            BroadcastEndTurnStatusOnHost();
         }
     }
 
-        private static void CheckAllPlayersEnded()
+    private static void CheckAllPlayersEndedOnHost()
     {
         bool allEnded;
-        int totalCount;
-        int endedCount;
-        string pendingBattleId;
-        int pendingRound;
+        string battleId;
+        int round;
 
         lock (_syncLock)
         {
-            totalCount = _activePlayerIds.Count;
-            endedCount = _endedPlayers.Count;
-            allEnded = totalCount > 0 && _endedPlayers.IsSupersetOf(_activePlayerIds);
-            pendingBattleId = _pendingBattleId;
-            pendingRound = _pendingRound;
+            battleId = _currentBattleId ?? "battle";
+            round = _currentRound;
+            allEnded = _activePlayerIds.Count > 0 && _hostReadyPlayers.IsSupersetOf(_activePlayerIds);
+
+            if (allEnded && !_hostRoundConfirmed)
+            {
+                _hostRoundConfirmed = true;
+            }
+            else if (!allEnded)
+            {
+                BroadcastEndTurnStatusOnHost();
+                return;
+            }
+            else
+            {
+                return;
+            }
         }
 
-        if (!allEnded)
+        INetworkClient client = TryGetNetworkClient();
+        if (client != null && client.IsConnected)
+        {
+            var confirmPayload = new
+            {
+                Timestamp = DateTime.UtcNow.Ticks,
+                BattleId = battleId,
+                Round = round,
+            };
+            client.SendGameEventData(NetworkMessageTypes.EndTurnConfirm, confirmPayload);
+            Plugin.Logger?.LogInfo($"[EndTurnSync] Host 裁定全体就绪，广播 EndTurnConfirm: BattleId={battleId}, Round={round}");
+        }
+
+        ProcessEndTurnConfirm(battleId, round);
+    }
+
+    private static void BroadcastEndTurnStatusOnHost()
+    {
+        INetworkClient client = TryGetNetworkClient();
+        if (client == null || !client.IsConnected)
         {
             return;
         }
 
+        string battleId;
+        int round;
+        string[] readyPlayers;
+        int totalActive;
+
+        lock (_syncLock)
+        {
+            battleId = _currentBattleId ?? "battle";
+            round = _currentRound;
+            readyPlayers = new string[_hostReadyPlayers.Count];
+            _hostReadyPlayers.CopyTo(readyPlayers);
+            totalActive = _activePlayerIds.Count;
+        }
+
+        var statusPayload = new
+        {
+            Timestamp = DateTime.UtcNow.Ticks,
+            BattleId = battleId,
+            Round = round,
+            ReadyPlayers = readyPlayers,
+            TotalActive = totalActive,
+        };
+
+        client.SendGameEventData(NetworkMessageTypes.EndTurnStatus, statusPayload);
+    }
+
+    private static void HandleEndTurnStatus(JsonElement root)
+    {
+        try
+        {
+            lock (_syncLock)
+            {
+                _endedPlayers.Clear();
+                if (root.TryGetProperty("ReadyPlayers", out JsonElement readyArr) && readyArr.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (JsonElement elem in readyArr.EnumerateArray())
+                    {
+                        string pid = elem.GetString();
+                        if (!string.IsNullOrWhiteSpace(pid))
+                        {
+                            _endedPlayers.Add(pid);
+                        }
+                    }
+                }
+            }
+
+            UpdateEndTurnButtonText();
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger?.LogWarning($"[EndTurnSync] HandleEndTurnStatus error: {ex.Message}");
+        }
+    }
+
+    private static void HandleEndTurnConfirm(JsonElement root)
+    {
+        try
+        {
+            string battleId = GetString(root, "BattleId") ?? "battle";
+            int round = GetInt(root, "Round", -1);
+            ProcessEndTurnConfirm(battleId, round);
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger?.LogWarning($"[EndTurnSync] HandleEndTurnConfirm error: {ex.Message}");
+        }
+    }
+
+    private static void ProcessEndTurnConfirm(string battleId, int round)
+    {
         BattleController battle = TryGetCurrentBattle();
+        string currentBattleId = battle != null ? GetBattleId(battle) : _currentBattleId;
+        int currentRound = battle != null ? battle.RoundCounter : _currentRound;
+
+        if (currentRound >= 0 && round != currentRound)
+        {
+            Plugin.Logger?.LogWarning($"[EndTurnSync] 忽略不匹配的 EndTurnConfirm (Round mismatch): incoming=({battleId}, {round}), current=({currentBattleId}, {currentRound})");
+            return;
+        }
+
+        if (!string.IsNullOrEmpty(currentBattleId) && !string.Equals(battleId, currentBattleId, StringComparison.Ordinal))
+        {
+            Plugin.Logger?.LogWarning($"[EndTurnSync] 忽略不匹配的 EndTurnConfirm (BattleId mismatch): incoming=({battleId}, {round}), current=({currentBattleId}, {currentRound})");
+            return;
+        }
+
+        lock (_syncLock)
+        {
+            if (_lastConfirmedRound == round && string.Equals(_lastConfirmedBattleId, battleId, StringComparison.Ordinal))
+            {
+                return;
+            }
+            _lastConfirmedBattleId = battleId;
+            _lastConfirmedRound = round;
+            _allowEndTurn = true;
+        }
+
         if (battle == null || !battle.IsWaitingPlayerInput)
         {
-
-            SchedulePendingProceed_NoThrow(pendingBattleId ?? "battle", pendingRound, battle == null ? "battle_null" : "not_waiting_input");
+            SchedulePendingProceed_NoThrow(battleId, round, battle == null ? "battle_null" : "not_waiting_input");
             return;
-        }
-
-        lock (_syncLock)
-        {
-            _allowEndTurn = true;
         }
 
         try
         {
+            Plugin.Logger?.LogInfo($"[EndTurnSync] 收到匹配的 EndTurnConfirm，执行本地 RequestEndPlayerTurn (BattleId={battleId}, Round={round})");
             battle.RequestEndPlayerTurn();
         }
-        catch
+        catch (Exception ex)
         {
-
+            Plugin.Logger?.LogError($"[EndTurnSync] 执行 RequestEndPlayerTurn 异常: {ex.Message}");
         }
     }
 
@@ -485,18 +751,6 @@ public static class EndTurnSyncPatch
             lock (_syncLock)
             {
                 _pendingProceedAttempts++;
-            }
-
-            bool allEnded;
-            lock (_syncLock)
-            {
-                allEnded = _activePlayerIds.Count > 0 && _endedPlayers.IsSupersetOf(_activePlayerIds);
-            }
-
-            if (!allEnded)
-            {
-                ClearPendingProceed_NoThrow();
-                return;
             }
 
             BattleController battle = TryGetCurrentBattle();
@@ -691,13 +945,19 @@ public static class EndTurnSyncPatch
                     return;
                 }
 
+                lock (_syncLock)
+                {
+                    _currentBattleId = GetBattleId(__instance);
+                    _currentRound = __instance.RoundCounter;
+                }
+
                 ResetLocalTurnState();
 
                 SetEndTurnButtonInteractable(true);
             }
-            catch
+            catch (Exception ex)
             {
-
+                Plugin.Logger?.LogError($"[EndTurnSync] StartPlayerTurn Postfix error: {ex.Message}");
             }
         }
     }
@@ -713,6 +973,12 @@ public static class EndTurnSyncPatch
                 if (!ShouldSync(__instance))
                 {
                     return;
+                }
+
+                lock (_syncLock)
+                {
+                    _currentBattleId = GetBattleId(__instance);
+                    _currentRound = __instance.RoundCounter;
                 }
 
                 ResetLocalTurnState();
@@ -777,8 +1043,6 @@ public static class EndTurnSyncPatch
                     {
                         _allowEndTurn = false;
                         _localEndedTurn = false;
-                        _pendingBattleId = null;
-                        _pendingRound = -1;
                     }
 
                     return true;
@@ -794,70 +1058,75 @@ public static class EndTurnSyncPatch
                     return true;
                 }
 
+                string battleId = GetBattleId(__instance);
+                int round = __instance.RoundCounter;
+
                 bool alreadyEnded;
+                int nextSeq;
                 lock (_syncLock)
                 {
                     alreadyEnded = _localEndedTurn;
+                    _localSeq++;
+                    nextSeq = _localSeq;
+                    _currentBattleId = battleId;
+                    _currentRound = round;
                 }
 
                 if (alreadyEnded)
                 {
-
                     lock (_syncLock)
                     {
                         _localEndedTurn = false;
-                        _endedPlayers.Remove(selfPlayerId);
                     }
 
                     try
                     {
-                        client.BroadcastState("EndTurnCancel", new
+                        client.SendGameEventData("EndTurnCancel", new
                         {
-                            Timestamp = DateTime.Now.Ticks,
+                            Timestamp = DateTime.UtcNow.Ticks,
                             PlayerId = selfPlayerId,
+                            BattleId = battleId,
+                            Round = round,
+                            Seq = nextSeq,
                         });
                     }
-                    catch
+                    catch (Exception ex)
                     {
-
+                        Plugin.Logger?.LogError($"[EndTurnSync] Send EndTurnCancel error: {ex.Message}");
                     }
 
                     RefreshAllCardsEdge();
-                    Plugin.Logger?.LogInfo($"[EndTurnSync] Cancelled end turn: {selfPlayerId}");
+                    Plugin.Logger?.LogInfo($"[EndTurnSync] Cancelled end turn: {selfPlayerId}, Seq={nextSeq}");
                     return false;
                 }
-
-                string battleId = GetBattleId(__instance);
-                int round = __instance.RoundCounter;
-
-                lock (_syncLock)
+                else
                 {
-                    _localEndedTurn = true;
-                    _pendingBattleId = battleId;
-                    _pendingRound = round;
-                    _endedPlayers.Add(selfPlayerId);
-                }
-
-                RefreshAllCardsEdge();
-
-                try
-                {
-                    client.BroadcastState(NetworkMessageTypes.EndTurnRequest, new
+                    lock (_syncLock)
                     {
-                        Timestamp = DateTime.Now.Ticks,
-                        PlayerId = selfPlayerId,
-                        BattleId = battleId,
-                        Round = round,
-                    });
+                        _localEndedTurn = true;
+                    }
+
+                    RefreshAllCardsEdge();
+
+                    try
+                    {
+                        client.SendGameEventData(NetworkMessageTypes.EndTurnRequest, new
+                        {
+                            Timestamp = DateTime.UtcNow.Ticks,
+                            PlayerId = selfPlayerId,
+                            BattleId = battleId,
+                            Round = round,
+                            Seq = nextSeq,
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.Logger?.LogError($"[EndTurnSync] Send EndTurnRequest error: {ex.Message}");
+                    }
+
+                    Plugin.Logger?.LogInfo($"[EndTurnSync] Requested end turn: {selfPlayerId}, BattleId={battleId}, Round={round}, Seq={nextSeq}");
+                    return false;
                 }
-                catch
-                {
-
-                }
-
-                CheckAllPlayersEnded();
-
-                return false;
             }
             catch (Exception ex)
             {
@@ -932,4 +1201,63 @@ public static class EndTurnSyncPatch
 
     private static bool GetBool(JsonElement root, string name)
         => NetworkEventHelper.GetBool(root, name);
+
+    #region Test Helpers
+    internal static void ResetForTest(string selfId, bool isHost, IEnumerable<string> activePlayers, int currentRound, string currentBattleId)
+    {
+        lock (_syncLock)
+        {
+            _selfPlayerId = selfId;
+            _selfIsHost = isHost;
+            _activePlayerIds = new HashSet<string>(activePlayers ?? Array.Empty<string>(), StringComparer.Ordinal);
+            _currentRound = currentRound;
+            _currentBattleId = currentBattleId;
+            _localSeq = 0;
+            _hostRoundConfirmed = false;
+            _hostReadyPlayers.Clear();
+            _playerLastSeq.Clear();
+            _endedPlayers.Clear();
+            _localEndedTurn = false;
+            _allowEndTurn = false;
+            _futureRoundReadyPlayers.Clear();
+            _pendingProceedBattleId = null;
+            _pendingProceedRound = -1;
+            _lastConfirmedBattleId = null;
+            _lastConfirmedRound = -1;
+        }
+    }
+
+    internal static void HandleEndTurnRequestForTest(JsonElement root) => HandleEndTurnRequest(root);
+    internal static void HandleEndTurnCancelForTest(JsonElement root) => HandleEndTurnCancel(root);
+    internal static void HandleEndTurnStatusForTest(JsonElement root) => HandleEndTurnStatus(root);
+    internal static void HandleEndTurnConfirmForTest(JsonElement root) => HandleEndTurnConfirm(root);
+
+    internal static HashSet<string> GetEndedPlayersForTest()
+    {
+        lock (_syncLock) { return new HashSet<string>(_endedPlayers, StringComparer.Ordinal); }
+    }
+
+    internal static HashSet<string> GetHostReadyPlayersForTest()
+    {
+        lock (_syncLock) { return new HashSet<string>(_hostReadyPlayers, StringComparer.Ordinal); }
+    }
+
+    internal static int GetFutureRoundReadyCountForTest(string battleId, int round)
+    {
+        lock (_syncLock)
+        {
+            return _futureRoundReadyPlayers.TryGetValue((battleId, round), out var set) ? set.Count : 0;
+        }
+    }
+
+    internal static bool IsRoundConfirmedForTest()
+    {
+        lock (_syncLock) { return _hostRoundConfirmed; }
+    }
+
+    internal static bool IsAllowEndTurnForTest()
+    {
+        lock (_syncLock) { return _allowEndTurn; }
+    }
+    #endregion
 }

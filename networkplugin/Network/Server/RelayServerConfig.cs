@@ -1,4 +1,4 @@
-﻿namespace NetworkPlugin.Network.Server;
+namespace NetworkPlugin.Network.Server;
 
 public class RelayServerConfig
 {
@@ -14,7 +14,7 @@ public class RelayServerConfig
 
         public string ServerName { get; set; } = "LBoL Relay Server";
 
-        public string ConnectionKey { get; set; } = "LBoL_Network_Plugin";
+    public string ConnectionKey { get; set; } = Security.SecurityUtils.GenerateSecureKey();
 
         public bool EnableNatPunchthrough { get; set; } = true;
 }

@@ -44,15 +44,36 @@ public partial class NetworkServer : BaseGameServer
 
     #region 构造函数
 
-        public NetworkServer(int port, int maxConnections, string connectionKey, ManualLogSource logger)
-        : base(CreateCore(port, maxConnections, connectionKey, logger))
+    internal Action<NetPeer, string, string, DeliveryMethod>? MessageSentForTest { get; set; }
+
+    internal NetworkServer(IServerCore core, ManualLogSource logger = null)
+        : base(core)
+    {
+        _logger = logger;
+    }
+
+    public NetworkServer(int port, int maxConnections, string connectionKey, ManualLogSource logger, string listenAddress = "0.0.0.0")
+        : base(CreateCore(port, maxConnections, connectionKey, logger, listenAddress))
     {
         _port = port;
         _maxConnections = maxConnections;
         _connectionKey = connectionKey;
 
         _logger = logger;
+    }
 
+    internal PlayerSession GetPlayerSessionByPeerForTest(NetPeer peer)
+    {
+        lock (SyncRoot)
+        {
+            SessionsByPeer.TryGetValue(peer, out var session);
+            return session;
+        }
+    }
+
+    internal void ProcessRawInboundForTest(NetPeer peer, string messageType, string json)
+    {
+        ProcessInboundMessageForTest(new ServerInboundMessage(peer, messageType, json, DeliveryMethod.ReliableOrdered, MessagePriority.Normal));
     }
 
     #endregion
@@ -121,6 +142,9 @@ public partial class NetworkServer : BaseGameServer
                     return;
                 case NetworkMessageTypes.PlayerReadyChanged:
                     HandlePlayerReadyChanged(senderSession, jsonPayload);
+                    return;
+                case NetworkMessageTypes.LeaveRoom:
+                    HandleLeaveRoom(senderSession);
                     return;
                 default:
                     Plugin.Logger?.LogInfo($"[服务器] 未知系统消息类型: {messageType}, 来自 {senderSession.Peer.EndPoint}");
@@ -199,6 +223,12 @@ public partial class NetworkServer : BaseGameServer
     {
         try
         {
+            if (string.Equals(eventType, NetworkMessageTypes.LeaveRoom, StringComparison.OrdinalIgnoreCase))
+            {
+                HandleLeaveRoom(session);
+                return;
+            }
+
             object eventData = JsonSerializer.Deserialize<object>(jsonPayload);
             string summary = NetLogHelper.BuildSummary(eventType, jsonPayload);
             Plugin.Logger?.LogInfo($"[服务器] 收到游戏事件: type={eventType}, from={session.PlayerId} ({summary})");
@@ -226,7 +256,33 @@ public partial class NetworkServer : BaseGameServer
         }
     }
 
-        private void HandlePlayerJoined(NetPeer fromPeer, string jsonPayload)
+    private void HandleLeaveRoom(PlayerSession senderSession)
+    {
+        if (senderSession == null) return;
+        lock (SyncRoot)
+        {
+            senderSession.IsConnected = false;
+            senderSession.Metadata["Left"] = true;
+            _disconnectedAtByPlayerId[senderSession.PlayerId] = DateTime.UtcNow;
+            if (senderSession.Peer != null)
+            {
+                _playerIdByPeerId.Remove(senderSession.Peer.Id);
+                _playerSessions.Remove(senderSession.Peer.Id);
+                SessionsByPeer.Remove(senderSession.Peer);
+            }
+
+            Plugin.Logger?.LogInfo($"[服务器] 玩家主动离开房间: {senderSession.PlayerId}");
+
+            BroadcastMessage(NetworkMessageTypes.PlayerLeft, new
+            {
+                PlayerId = senderSession.PlayerId
+            });
+
+            BroadcastPlayerList();
+        }
+    }
+
+    private void HandlePlayerJoined(NetPeer fromPeer, string jsonPayload)
     {
         try
         {
@@ -235,6 +291,9 @@ public partial class NetworkServer : BaseGameServer
             {
                 return;
             }
+
+            session.Metadata["IsConfirmed"] = true;
+            session.Metadata.Remove("Left");
 
             if (playerInfo != null)
             {
@@ -311,7 +370,7 @@ public partial class NetworkServer : BaseGameServer
                     return;
                 }
 
-                if (targetSession.IsConnected)
+                if (targetSession.IsConnected && targetSession.Peer == fromPeer)
                 {
                     SendMessage(fromPeer, NetworkMessageTypes.Reconnect_RESPONSE, new { Success = false, Error = "Already connected" });
                     return;
@@ -344,25 +403,40 @@ public partial class NetworkServer : BaseGameServer
                     SessionsByPeer.Remove(fromPeer);
                 }
 
+                if (targetSession.Peer != null && targetSession.Peer != fromPeer)
+                {
+                    SessionsByPeer.Remove(targetSession.Peer);
+                    _playerIdByPeerId.Remove(targetSession.Peer.Id);
+                    _playerSessions.Remove(targetSession.Peer.Id);
+                }
+
                 targetSession.Peer = fromPeer;
                 targetSession.IsConnected = true;
+                targetSession.Metadata["IsConfirmed"] = true;
+                targetSession.Metadata.Remove("Left");
                 targetSession.UpdateHeartbeat();
                 targetSession.UpdateMessageTime();
 
+                SessionsByPeer[fromPeer] = targetSession;
                 _playerIdByPeerId[fromPeer.Id] = targetSession.PlayerId;
                 _playerSessions[fromPeer.Id] = targetSession;
                 _disconnectedAtByPlayerId.Remove(targetSession.PlayerId);
 
-                SessionsByPeer[fromPeer] = targetSession;
-            }
+                string newToken = GenerateReconnectToken();
+                targetSession.Metadata["ReconnectToken"] = newToken;
 
-            SendMessage(fromPeer, NetworkMessageTypes.Reconnect_RESPONSE, new
-            {
-                Success = true,
-                PlayerId = targetSession.PlayerId,
-                IsHost = targetSession.IsHost,
-                ConnectedAt = targetSession.ConnectedAt.Ticks
-            });
+                SendMessage(fromPeer, NetworkMessageTypes.Reconnect_RESPONSE, new
+                {
+                    Success = true,
+                    PlayerId = targetSession.PlayerId,
+                    IsHost = targetSession.IsHost,
+                    ConnectedAt = targetSession.ConnectedAt.Ticks,
+                    ReconnectToken = newToken,
+                    SessionNonce = targetSession.SessionNonce
+                });
+
+                Plugin.Logger?.LogInfo($"[服务器] 玩家 {targetSession.PlayerId} 重连成功并已合并会话，轮换新凭证。");
+            }
 
             BroadcastPlayerList();
         }
@@ -465,12 +539,13 @@ public partial class NetworkServer : BaseGameServer
         _logger?.LogInfo("[服务器] 已停止。");
     }
 
-    private static IServerCore CreateCore(int port, int maxConnections, string connectionKey, ManualLogSource logger)
+    private static IServerCore CreateCore(int port, int maxConnections, string connectionKey, ManualLogSource logger, string listenAddress = "0.0.0.0")
     {
         return new ServerCore(
             new ServerOptions
             {
                 Port = port,
+                ListenAddress = listenAddress,
                 MaxConnections = maxConnections,
                 ConnectionKey = connectionKey,
                 DisconnectTimeoutMs = ServerConstants.DisconnectTimeoutSeconds * 1000,
@@ -519,7 +594,17 @@ public partial class NetworkServer : BaseGameServer
         Plugin.Logger?.LogInfo($"[服务器] 客户端已连接: {session.Peer.EndPoint}");
         _logger?.LogInfo($"[服务器] 客户端已连接: {session.Peer.EndPoint}");
 
-        BroadcastPlayerList();
+        if (session.IsHost)
+        {
+            session.Metadata["IsConfirmed"] = true;
+            session.Metadata.Remove("Left");
+            BroadcastPlayerList();
+        }
+        else
+        {
+            session.Metadata["IsConfirmed"] = false;
+        }
+
         SendWelcomeMessage(session.Peer, session);
     }
 

@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using NetworkPlugin.Network.NetworkPlayer;
 
 namespace NetworkPlugin.Network.Client;
@@ -18,6 +18,8 @@ public interface INetworkManager
         IEnumerable<INetworkPlayer> GetAllPlayers();
 
         int GetPlayerCount();
+
+        void ClearAllPlayers();
 
         bool IsConnected => GetPlayerCount() > 0;
 }

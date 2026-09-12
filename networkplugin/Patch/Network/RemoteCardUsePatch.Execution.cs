@@ -530,13 +530,24 @@ public static partial class RemoteCardUsePatch
         return list;
     }
 
+    public const float MaxPlausibleDamage = 500f;
+    public const int MaxPlausibleHeal = 100;
+    public const int MaxPlausibleStatusLevel = 999;
+    public const int MaxPlausibleStatusDuration = 99;
+    public const int MaxPlausibleStatusCount = 999;
+    public const int MaxPlausibleStatusLimit = 999;
+
     private static void TryAddReplayDamage(List<BattleAction> list, JsonElement item, Unit caster, Unit target, BattleController battle)
     {
         try
         {
             float? dmg = GetFloat(item, "Damage") ?? GetFloat(item, "Amount");
-            if (dmg == null)
+            if (dmg == null || dmg.Value < 0f || dmg.Value > MaxPlausibleDamage)
             {
+                if (dmg != null && (dmg.Value > MaxPlausibleDamage || dmg.Value < 0f))
+                {
+                    Plugin.Logger?.LogWarning($"[RemoteCardUse] 拒绝执行异常伤害值: {dmg.Value} (上限: {MaxPlausibleDamage})");
+                }
                 return;
             }
 
@@ -607,6 +618,11 @@ public static partial class RemoteCardUsePatch
 
             int b = Math.Max(0, (int)Math.Round(block ?? 0f));
             int s = Math.Max(0, (int)Math.Round(shield ?? 0f));
+            if (b > (int)MaxPlausibleDamage || s > (int)MaxPlausibleDamage)
+            {
+                Plugin.Logger?.LogWarning($"[RemoteCardUse] 拒绝执行异常格挡/护盾值: b={b}, s={s} (上限: {MaxPlausibleDamage})");
+                return;
+            }
             list.Add(new CastBlockShieldAction(actionSource, actionTarget, b, s, type, cast));
         }
         catch (Exception ex)
@@ -629,8 +645,12 @@ public static partial class RemoteCardUsePatch
                 }
             }
 
-            if (amount == null)
+            if (amount == null || amount.Value < 0 || amount.Value > MaxPlausibleHeal)
             {
+                if (amount != null && (amount.Value > MaxPlausibleHeal || amount.Value < 0))
+                {
+                    Plugin.Logger?.LogWarning($"[RemoteCardUse] 拒绝执行异常治疗值: {amount.Value} (上限: {MaxPlausibleHeal})");
+                }
                 return;
             }
 
@@ -670,6 +690,28 @@ public static partial class RemoteCardUsePatch
             int? duration = GetInt(item, "Duration");
             int? count = GetInt(item, "Count");
             int? limit = GetInt(item, "Limit");
+
+            if (level != null && (level.Value < 0 || level.Value > MaxPlausibleStatusLevel))
+            {
+                Plugin.Logger?.LogWarning($"[RemoteCardUse] 拒绝执行异常状态层数: {level.Value} (上限: {MaxPlausibleStatusLevel})");
+                return;
+            }
+            if (duration != null && (duration.Value < 0 || duration.Value > MaxPlausibleStatusDuration))
+            {
+                Plugin.Logger?.LogWarning($"[RemoteCardUse] 拒绝执行异常状态持续时间: {duration.Value} (上限: {MaxPlausibleStatusDuration})");
+                return;
+            }
+            if (count != null && (count.Value < 0 || count.Value > MaxPlausibleStatusCount))
+            {
+                Plugin.Logger?.LogWarning($"[RemoteCardUse] 拒绝执行异常状态计数: {count.Value} (上限: {MaxPlausibleStatusCount})");
+                return;
+            }
+            if (limit != null && (limit.Value < 0 || limit.Value > MaxPlausibleStatusLimit))
+            {
+                Plugin.Logger?.LogWarning($"[RemoteCardUse] 拒绝执行异常状态上限: {limit.Value} (上限: {MaxPlausibleStatusLimit})");
+                return;
+            }
+
             float waitTime = GetFloat(item, "WaitTime") ?? 0f;
             bool startAutoDecreasing = GetBool(item, "StartAutoDecreasing") ?? true;
 
@@ -717,6 +759,15 @@ public static partial class RemoteCardUsePatch
                 int count = GetInt(item, "Count") ?? 0;
                 int limit = GetInt(item, "Limit") ?? 0;
 
+                if (level < 0 || level > MaxPlausibleStatusLevel ||
+                    duration < 0 || duration > MaxPlausibleStatusDuration ||
+                    count < 0 || count > MaxPlausibleStatusCount ||
+                    limit < 0 || limit > MaxPlausibleStatusLimit)
+                {
+                    Plugin.Logger?.LogWarning($"[RemoteCardUse] 状态效果快照越界丢弃: effect={effectId}, level={level}, dur={duration}, cnt={count}, lim={limit}");
+                    continue;
+                }
+
                 bool autoDecreasing = GetBool(item, "IsAutoDecreasing") ?? true;
                 TrySetProperty(effect, "IsAutoDecreasing", autoDecreasing);
 
@@ -743,9 +794,9 @@ public static partial class RemoteCardUsePatch
                 AddStatusEffectNoStack(owner, effect);
             }
         }
-        catch
+        catch (Exception ex)
         {
-
+            Plugin.Logger?.LogDebug($"[RemoteCardUse] ApplyStatusEffectSnapshot error: {ex.Message}");
         }
     }
 
@@ -1505,12 +1556,18 @@ public static partial class RemoteCardUsePatch
                     OtherPlayersOverlayPatch.TryGetRemoteCharacterUnitView(defaultSenderPlayerId, out UnitView senderView) &&
                     senderView != null)
                 {
-                    affectedViews.Add(senderView);
+                    EnsureUnitIdle(senderView);
                 }
-
-                foreach (UnitView view in affectedViews)
+                else
                 {
-                    EnsureUnitIdle(view);
+                    // 仅清理施法者自身的玩家动画，不干扰其他角色或受击目标的动画
+                    foreach (UnitView view in affectedViews)
+                    {
+                        if (view != null && view.Unit is PlayerUnit)
+                        {
+                            EnsureUnitIdle(view);
+                        }
+                    }
                 }
             }
             finally
@@ -1798,85 +1855,109 @@ public static partial class RemoteCardUsePatch
             yield break;
         }
 
-        float realDamage = GetFloat(actionEl, ActionBlueprintConstants.KeyDamage) ?? GetFloat(actionEl, ActionBlueprintConstants.KeyAmount) ?? 0f;
-        string damageTypeStr = GetString(actionEl, ActionBlueprintConstants.KeyDamageType);
-        DamageType damageType = Enum.TryParse(damageTypeStr, out DamageType parsedDt) ? parsedDt : DamageType.Attack;
-        bool isAccuracy = GetBool(actionEl, ActionBlueprintConstants.KeyIsAccuracy) ?? false;
-        bool dontBreakPerfect = GetBool(actionEl, ActionBlueprintConstants.KeyDontBreakPerfect) ?? false;
-
-        DamageInfo realDamageInfo = damageType switch
+        // 注册特定攻击与受击目标，支持逐目标去重
+        string attackId = GetString(actionEl, "AttackId") ?? GetString(actionEl, "PlayId") ?? Guid.NewGuid().ToString("N");
+        var targetIds = new List<string>();
+        foreach (Unit t in targets)
         {
-            DamageType.HpLose => DamageInfo.HpLose(realDamage, dontBreakPerfect),
-            DamageType.Reaction => DamageInfo.Reaction(realDamage, dontBreakPerfect),
-            DamageType.Attack => DamageInfo.Attack(realDamage, isAccuracy),
-            _ => DamageInfo.Attack(realDamage, isAccuracy)
-        };
-        realDamageInfo.DontBreakPerfect = dontBreakPerfect;
-
-        if (!string.IsNullOrEmpty(gunName) && gunName != "Empty" && gunName != "Instant")
-        {
-            var pairs = new List<ValueTuple<UnitView, DamageInfo>>();
-            foreach (UnitView tv in targetViews)
+            if (t != null)
             {
-                pairs.Add(new ValueTuple<UnitView, DamageInfo>(tv, realDamageInfo));
-            }
-
-            bool isBusy = false;
-            try
-            {
-                object statusObj = Traverse.Create(sourceView).Field("_status").GetValue();
-                int statusInt = statusObj != null ? Convert.ToInt32(statusObj) : 0;
-                if (gunType == GunType.Middle || gunType == GunType.Last)
+                if (!string.IsNullOrEmpty(t.Id)) targetIds.Add(t.Id);
+                if (t is EnemyUnit eu && SpawnedEnemySyncPatch.TryGetSpawnId(eu, out string sid))
                 {
-                    if (statusInt != ActionBlueprintConstants.ShootStatusComplex)
-                    {
-                        isBusy = true;
-                    }
-                }
-                else
-                {
-                    if (statusInt != ActionBlueprintConstants.ShootStatusIdle)
-                    {
-                        EnsureUnitIdle(sourceView, forceReset: true);
-                    }
+                    targetIds.Add(sid);
                 }
             }
-            catch (Exception ex)
-            {
-                Plugin.Logger?.LogDebug($"[RemoteCardUse] Check sourceView _status failed: {ex.Message}");
-                isBusy = false;
-            }
+        }
 
-            if (!isBusy)
+        RemoteCardPlaybackTracker.NotifyAttackStarted(attackId, targetIds);
+
+        try
+        {
+            float blocked = GetFloat(actionEl, "DamageBlocked") ?? GetFloat(actionEl, "Blocked") ?? GetFloat(actionEl, "Block") ?? 0f;
+            float shielded = GetFloat(actionEl, "DamageShielded") ?? GetFloat(actionEl, "Shielded") ?? GetFloat(actionEl, "Shield") ?? 0f;
+            float actualDamage = GetFloat(actionEl, "ActualDamage") ?? GetFloat(actionEl, "HpDamage") ?? (GetFloat(actionEl, ActionBlueprintConstants.KeyDamage) ?? GetFloat(actionEl, ActionBlueprintConstants.KeyAmount) ?? 0f);
+            string damageTypeStr = GetString(actionEl, ActionBlueprintConstants.KeyDamageType);
+            DamageType damageType = Enum.TryParse(damageTypeStr, out DamageType parsedDt) ? parsedDt : DamageType.Attack;
+            bool isAccuracy = GetBool(actionEl, ActionBlueprintConstants.KeyIsAccuracy) ?? false;
+            bool dontBreakPerfect = GetBool(actionEl, ActionBlueprintConstants.KeyDontBreakPerfect) ?? false;
+            bool isGrazed = GetBool(actionEl, "IsGrazed") ?? GetBool(actionEl, "IsGraze") ?? false;
+            bool isCanceled = GetBool(actionEl, "IsCanceled") ?? false;
+
+            float displayHpDamage = (isCanceled || isGrazed) ? 0f : actualDamage;
+            DamageInfo realDamageInfo = damageType switch
             {
-                bool shootOk = false;
-                IEnumerator shootEnumerator = null;
+                DamageType.HpLose => DamageInfo.HpLose(displayHpDamage, dontBreakPerfect),
+                DamageType.Reaction => DamageInfo.Reaction(displayHpDamage, dontBreakPerfect),
+                _ => DamageInfo.Attack(displayHpDamage, isAccuracy)
+            };
+            realDamageInfo.DontBreakPerfect = dontBreakPerfect;
+            realDamageInfo.DamageBlocked = isCanceled ? 0f : blocked;
+            realDamageInfo.DamageShielded = isCanceled ? 0f : shielded;
+            realDamageInfo.IsGrazed = isGrazed;
+
+            if (!string.IsNullOrEmpty(gunName) && gunName != "Empty" && gunName != "Instant")
+            {
+                var pairs = new List<ValueTuple<UnitView, DamageInfo>>();
+                foreach (UnitView tv in targetViews)
+                {
+                    pairs.Add(new ValueTuple<UnitView, DamageInfo>(tv, realDamageInfo));
+                }
+
+                bool isBusy = false;
                 try
                 {
-                    var method = Traverse.Create(typeof(GameDirector)).Method("GunShootAction", sourceView, pairs, gunName, gunType);
-                    if (method.MethodExists())
+                    object statusObj = Traverse.Create(sourceView).Field("_status").GetValue();
+                    int statusInt = statusObj != null ? Convert.ToInt32(statusObj) : 0;
+                    if (gunType == GunType.Middle || gunType == GunType.Last)
                     {
-                        shootEnumerator = (System.Collections.IEnumerator)method.GetValue();
-                        shootOk = shootEnumerator != null;
+                        if (statusInt != ActionBlueprintConstants.ShootStatusComplex)
+                        {
+                            isBusy = true;
+                        }
+                    }
+                    else
+                    {
+                        if (statusInt != ActionBlueprintConstants.ShootStatusIdle)
+                        {
+                            EnsureUnitIdle(sourceView, forceReset: true);
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
-                    Plugin.Logger?.LogWarning($"[RemoteCardUse] GunShootAction call failed: {ex.Message}");
-                    shootOk = false;
+                    Plugin.Logger?.LogDebug($"[RemoteCardUse] Check sourceView _status failed: {ex.Message}");
+                    isBusy = false;
                 }
 
-                if (shootOk)
+                if (!isBusy)
                 {
+                    bool shootOk = false;
+                    IEnumerator shootEnumerator = null;
                     try
                     {
-                        Traverse.Create(typeof(GameDirector)).Field("_gunHitArgs").SetValue(new GunHitArgs(true, pairs, gunName));
+                        var method = Traverse.Create(typeof(GameDirector)).Method("GunShootAction", sourceView, pairs, gunName, gunType);
+                        if (method.MethodExists())
+                        {
+                            shootEnumerator = (System.Collections.IEnumerator)method.GetValue();
+                            shootOk = shootEnumerator != null;
+                        }
                     }
                     catch (Exception ex)
                     {
-                        Plugin.Logger?.LogDebug($"[RemoteCardUse] Override _gunHitArgs failed: {ex.Message}");
+                        Plugin.Logger?.LogWarning($"[RemoteCardUse] GunShootAction call failed: {ex.Message}");
+                        shootOk = false;
                     }
-                    yield return shootEnumerator;
+
+                    if (shootOk)
+                    {
+                        // 绝不覆盖原游戏的全局 _gunHitArgs，防止破坏本地玩家或其他角色的并发命中回调
+                        yield return shootEnumerator;
+                    }
+                    else
+                    {
+                        PerformSafeShoot(sourceView, targetViews, gunName, realDamageInfo);
+                    }
                 }
                 else
                 {
@@ -1885,26 +1966,26 @@ public static partial class RemoteCardUsePatch
             }
             else
             {
-                PerformSafeShoot(sourceView, targetViews, gunName, realDamageInfo);
-            }
-        }
-        else
-        {
-            foreach (UnitView tv in targetViews)
-            {
-                SafePlayAnimation(tv, ActionBlueprintConstants.AnimHit);
-                if (realDamage > 0f && PopupHud.Instance != null && tv != null)
+                foreach (UnitView tv in targetViews)
                 {
-                    try
+                    SafePlayAnimation(tv, ActionBlueprintConstants.AnimHit);
+                    if (!isCanceled && !isGrazed && (!realDamageInfo.ZeroDamage || isAccuracy) && PopupHud.Instance != null && tv != null)
                     {
-                        PopupHud.Instance.DamagePopupFromScene(realDamageInfo, tv.transform.position, sourceIsPlayer: true);
-                    }
-                    catch (Exception ex)
-                    {
-                        Plugin.Logger?.LogDebug($"[RemoteCardUse] PlayDamageVisual fallback popup failed: {ex.Message}");
+                        try
+                        {
+                            PopupHud.Instance.DamagePopupFromScene(realDamageInfo, tv.transform.position, sourceIsPlayer: true);
+                        }
+                        catch (Exception ex)
+                        {
+                            Plugin.Logger?.LogDebug($"[RemoteCardUse] PlayDamageVisual fallback popup failed: {ex.Message}");
+                        }
                     }
                 }
             }
+        }
+        finally
+        {
+            RemoteCardPlaybackTracker.NotifyAttackEnded(attackId);
         }
     }
 

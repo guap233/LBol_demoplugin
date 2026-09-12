@@ -1,4 +1,4 @@
-﻿using BepInEx.Configuration;
+using BepInEx.Configuration;
 using NetworkPlugin.Network;
 
 namespace NetworkPlugin.Configuration;
@@ -18,6 +18,8 @@ public partial class ConfigManager
         public ConfigEntry<int> HostMaxConnections { get; private set; }
 
         public ConfigEntry<string> HostConnectionKey { get; private set; }
+
+        public ConfigEntry<string> HostListenAddress { get; private set; }
 
         public ConfigEntry<int> ServerPort { get; private set; }
 
@@ -78,8 +80,15 @@ public partial class ConfigManager
         HostConnectionKey = configFile.Bind(
             "Network",
             "HostConnectionKey",
-            "LBoL_Network_Plugin",
-            "做房主本地服务器连接密钥"
+            Network.Security.SecurityUtils.GenerateSecureKey(),
+            "做房主本地服务器连接密钥（默认启动时动态生成高熵随机凭证）。"
+        );
+
+        HostListenAddress = configFile.Bind(
+            "Network",
+            "HostListenAddress",
+            "0.0.0.0",
+            "做房主本地服务器物理监听地址（如 0.0.0.0 监听所有接口，或 127.0.0.1 仅本机回环）。"
         );
 
         ServerPort = configFile.Bind(
@@ -120,8 +129,8 @@ public partial class ConfigManager
         RelayServerConnectionKey = configFile.Bind(
             "RelayServer",
             "ConnectionKey",
-            "LBoL_Network_Plugin",
-            "中继服务器连接密钥"
+            Network.Security.SecurityUtils.GenerateSecureKey(),
+            "中继服务器连接密钥（默认启动时动态生成高熵随机凭证）。"
         );
 
         RelayServerMaxRooms = configFile.Bind(
@@ -145,7 +154,7 @@ public partial class ConfigManager
         {
             Port = RelayServerPort?.Value ?? NetworkConstants.RelayPort,
             MaxConnections = RelayServerMaxConnections?.Value ?? 1000,
-            ConnectionKey = RelayServerConnectionKey?.Value ?? "LBoL_Network_Plugin",
+            ConnectionKey = RelayServerConnectionKey?.Value ?? Network.Security.SecurityUtils.GenerateSecureKey(),
             MaxRooms = RelayServerMaxRooms?.Value ?? NetworkPlugin.Network.Server.ServerConstants.MaxRoomCount,
             MaxPlayersPerRoom = RelayServerMaxPlayersPerRoom?.Value ?? NetworkPlugin.Network.Server.ServerConstants.DefaultMaxPlayersPerRoom
         };

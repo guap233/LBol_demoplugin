@@ -59,6 +59,7 @@ public partial class NetworkServer
         try
         {
             string json = JsonCompat.Serialize(data);
+            MessageSentForTest?.Invoke(peer, messageType, json, DeliveryMethod.ReliableOrdered);
             NetDataWriter writer = new NetDataWriter();
             writer.Put(messageType);
             writer.Put(json);
@@ -114,7 +115,10 @@ public partial class NetworkServer
             PlayerId = session.PlayerId,
             IsHost = session.IsHost,
             ReconnectToken = TryGetMetadataString(session.Metadata, "ReconnectToken"),
-            PlayerList = _sessionsByPlayerId.Values.Select(s => new
+            SessionNonce = session.SessionNonce,
+            PlayerList = _sessionsByPlayerId.Values
+                .Where(s => !s.Metadata.ContainsKey("Left") && (s.IsHost || (s.Metadata.TryGetValue("IsConfirmed", out var c) && c is bool b && b)))
+                .Select(s => new
             {
                 PlayerId = s.PlayerId,
                 PlayerName = s.PlayerName,
@@ -134,7 +138,9 @@ public partial class NetworkServer
 
         private void BroadcastPlayerList()
     {
-        var playerList = _sessionsByPlayerId.Values.Select(s => new
+        var playerList = _sessionsByPlayerId.Values
+            .Where(s => !s.Metadata.ContainsKey("Left") && (s.IsHost || (s.Metadata.TryGetValue("IsConfirmed", out var c) && c is bool b && b)))
+            .Select(s => new
         {
             PlayerId = s.PlayerId,
             PlayerName = s.PlayerName,

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using HarmonyLib;
@@ -18,6 +18,7 @@ using NetworkPlugin.Network.Snapshot;
 
 namespace NetworkPlugin.Patch.Actions;
 
+[HarmonyPatch]
 public class TurnAction_Patch
 {
     #region 依赖注入
@@ -28,9 +29,9 @@ public class TurnAction_Patch
 
     #region 玩家回合开始同步
 
-        [HarmonyPatch(typeof(StartPlayerTurnAction), "Execute")]
+        [HarmonyPatch(typeof(BattleController), "StartPlayerTurn")]
     [HarmonyPostfix]
-    public static void StartPlayerTurn_Postfix(StartPlayerTurnAction __instance)
+    public static void StartPlayerTurn_Postfix(BattleController __instance)
     {
         try
         {
@@ -50,10 +51,15 @@ public class TurnAction_Patch
 
             NetworkIdentityTracker.EnsureSubscribed(networkClient);
 
-            BattleController battle = __instance.Unit?.Battle;
-            if (battle == null)
+            BattleController battle = __instance;
+            if (battle == null || battle.Player == null)
             {
                 Plugin.Logger?.LogDebug("[TurnSync] battle 为空（StartPlayerTurn）");
+                return;
+            }
+
+            if (battle.Player != GameStateUtils.GetCurrentPlayer())
+            {
                 return;
             }
 
@@ -71,9 +77,9 @@ public class TurnAction_Patch
 
     #region 玩家回合结束同步
 
-        [HarmonyPatch(typeof(EndPlayerTurnAction), "Execute")]
+        [HarmonyPatch(typeof(BattleController), "EndPlayerTurn")]
     [HarmonyPostfix]
-    public static void EndPlayerTurn_Postfix(EndPlayerTurnAction __instance)
+    public static void EndPlayerTurn_Postfix(BattleController __instance)
     {
         try
         {
@@ -93,10 +99,15 @@ public class TurnAction_Patch
 
             NetworkIdentityTracker.EnsureSubscribed(networkClient);
 
-            BattleController battle = __instance.Unit?.Battle;
-            if (battle == null)
+            BattleController battle = __instance;
+            if (battle == null || battle.Player == null)
             {
                 Plugin.Logger?.LogDebug("[TurnSync] battle 为空（EndPlayerTurn）");
+                return;
+            }
+
+            if (battle.Player != GameStateUtils.GetCurrentPlayer())
+            {
                 return;
             }
 
@@ -118,9 +129,9 @@ public class TurnAction_Patch
 
     #region 战斗开始/结束同步（预留）
 
-        [HarmonyPatch(typeof(StartBattleAction), "Execute")]
+        [HarmonyPatch(typeof(BattleController), "StartBattle")]
     [HarmonyPostfix]
-    public static void StartBattle_Postfix(StartBattleAction __instance)
+    public static void StartBattle_Postfix(BattleController __instance)
     {
         try
         {
@@ -142,7 +153,7 @@ public class TurnAction_Patch
                 return;
             }
 
-            BattleController battle = __instance?.Battle;
+            BattleController battle = __instance;
             if (battle == null || battle.Player == null)
             {
                 return;
@@ -201,9 +212,13 @@ public class TurnAction_Patch
         }
     }
 
-        [HarmonyPatch(typeof(EndBattleAction), "Execute")]
+    #endregion
+
+    #region 战斗结束同步
+
+        [HarmonyPatch(typeof(BattleController), "EndBattle")]
     [HarmonyPostfix]
-    public static void EndBattle_Postfix(EndBattleAction __instance)
+    public static void EndBattle_Postfix(BattleController __instance)
     {
         try
         {
@@ -224,7 +239,7 @@ public class TurnAction_Patch
                 return;
             }
 
-            BattleController battle = __instance?.Battle;
+            BattleController battle = __instance;
             if (battle == null || battle.Player == null)
             {
                 return;

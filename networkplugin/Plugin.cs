@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
@@ -16,6 +16,7 @@ using NetworkPlugin.Network.Client;
 using NetworkPlugin.Network.MidGameJoin;
 using NetworkPlugin.Network.NetworkPlayer;
 using NetworkPlugin.Network.Reconnection;
+using NetworkPlugin.Core.Trade;
 using UnityEngine;
 using System.Diagnostics;
 
@@ -34,6 +35,8 @@ public class Plugin : BaseUnityPlugin
 
     internal static int MainThreadId { get; private set; }
 
+    private static int _mainThreadQueueWarningCount;
+
     internal static void RunOnMainThread(Action action)
     {
         if (action == null)
@@ -41,20 +44,31 @@ public class Plugin : BaseUnityPlugin
             return;
         }
 
+        if (_mainThreadActions.Count >= Network.NetworkConstants.MaxMainThreadQueueSize)
+        {
+            if (Interlocked.Increment(ref _mainThreadQueueWarningCount) % 100 == 1)
+            {
+                Logger?.LogWarning($"[Plugin] 主线程任务调度队列已达上限 ({Network.NetworkConstants.MaxMainThreadQueueSize})，已拒绝积压任务");
+            }
+            return;
+        }
+
         _mainThreadActions.Enqueue(action);
     }
 
-    internal static void FlushMainThreadActionsForTest()
+    internal static void FlushMainThreadActionsForTest(int maxCount = -1)
     {
-        while (_mainThreadActions.TryDequeue(out Action a))
+        int count = 0;
+        while ((maxCount < 0 || count < maxCount) && _mainThreadActions.TryDequeue(out Action a))
         {
+            count++;
             try
             {
                 a?.Invoke();
             }
-            catch
+            catch (Exception ex)
             {
-
+                Logger?.LogDebug($"[Plugin] Main thread test action failed: {ex.Message}");
             }
         }
     }
@@ -107,6 +121,15 @@ public class Plugin : BaseUnityPlugin
         catch (Exception ex)
         {
             Logger?.LogWarning($"[Plugin] Failed to initialize MidGameJoinManager: {ex.Message}");
+        }
+
+        try
+        {
+            _serviceProvider.GetService<TradeSettlementCoordinator>();
+        }
+        catch (Exception ex)
+        {
+            Logger?.LogWarning($"[Plugin] Failed to initialize TradeSettlementCoordinator: {ex.Message}");
         }
 
         if (gameObject == null)
@@ -293,6 +316,9 @@ public class Plugin : BaseUnityPlugin
         services.AddSingleton<MidGameJoinManager>();
 
         services.AddSingleton(sp => new MapCatchUpOrchestrator(Logger, sp.GetRequiredService<RoomSyncManager>()));
+
+        services.AddSingleton<ITradeInventory, GameRunTradeInventory>();
+        services.AddSingleton<TradeSettlementCoordinator>();
     }
 
         void Update()

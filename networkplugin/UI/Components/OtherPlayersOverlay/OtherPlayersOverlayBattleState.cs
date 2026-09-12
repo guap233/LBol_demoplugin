@@ -12,7 +12,7 @@ public static partial class OtherPlayersOverlayPatch
 {
     private static readonly Dictionary<string, VirtualAiBattleStateEntry> _virtualAiBattleStates;
 
-    private struct RemoteBattleState
+    internal struct RemoteBattleState
     {
         public int Health { get; set; }
         public int MaxHealth { get; set; }
@@ -38,7 +38,7 @@ public static partial class OtherPlayersOverlayPatch
             return false;
         }
 
-        if (TryGetVirtualAiDebugBattleState(playerSummary.PlayerId, out state))
+        if (IsVirtualAiDebugPlayerId(playerSummary.PlayerId) && TryGetVirtualAiDebugBattleState(playerSummary.PlayerId, out state))
         {
             return true;
         }
@@ -53,7 +53,12 @@ public static partial class OtherPlayersOverlayPatch
 
         if (!hasSnapshot && !hasRuntime)
         {
-            int defaultMaxHp = playerSummary.MaxHp > 0 ? playerSummary.MaxHp : GetDefaultMaxHpForCharacter(playerSummary.CharacterId);
+            if (playerSummary.MaxHp <= 0)
+            {
+                return false;
+            }
+
+            int defaultMaxHp = playerSummary.MaxHp;
             int defaultHp = playerSummary.Hp >= 0 ? Math.Min(playerSummary.Hp, defaultMaxHp) : defaultMaxHp;
             state = new RemoteBattleState
             {
@@ -81,8 +86,11 @@ public static partial class OtherPlayersOverlayPatch
 
         if (maxHealth <= 0)
         {
-            maxHealth = playerSummary.MaxHp > 0 ? playerSummary.MaxHp : GetDefaultMaxHpForCharacter(playerSummary.CharacterId);
-            if (health <= 0) health = playerSummary.Hp >= 0 ? playerSummary.Hp : maxHealth;
+            maxHealth = playerSummary.MaxHp > 0 ? playerSummary.MaxHp : 0;
+            if (maxHealth <= 0)
+            {
+                return false;
+            }
         }
 
         state = new RemoteBattleState
@@ -129,18 +137,19 @@ public static partial class OtherPlayersOverlayPatch
             _virtualAiBattleStates[playerId] = entry;
         }
 
-        float now = Time.unscaledTime;
+        float now = (float)(DateTime.UtcNow.Ticks / 10_000_000.0);
         if (now >= entry.NextRefreshTime)
         {
+            var rng = new System.Random();
             int variant = string.Equals(playerId, "aidefault3", StringComparison.Ordinal) ? 2 : (string.Equals(playerId, "aidefault2", StringComparison.Ordinal) ? 1 : 0);
-            int maxHealth = UnityEngine.Random.Range(48 + variant * 10, 91 + variant * 10);
-            int healthMin = Mathf.Max(8, maxHealth / 3);
-            int health = UnityEngine.Random.Range(healthMin, maxHealth + 1);
-            int shield = UnityEngine.Random.Range(0, 18 + variant * 12);
-            int block = UnityEngine.Random.Range(0, 16 + variant * 10);
+            int maxHealth = rng.Next(48 + variant * 10, 92 + variant * 10);
+            int healthMin = Math.Max(8, maxHealth / 3);
+            int health = rng.Next(healthMin, maxHealth + 1);
+            int shield = rng.Next(0, 19 + variant * 12);
+            int block = rng.Next(0, 17 + variant * 10);
             int powerPerLevel = 100;
             int maxPowerLevel = 3;
-            int currentPower = UnityEngine.Random.Range(0, powerPerLevel * maxPowerLevel + 1);
+            int currentPower = rng.Next(0, powerPerLevel * maxPowerLevel + 1);
 
             entry.State = new RemoteBattleState
             {
@@ -153,7 +162,7 @@ public static partial class OtherPlayersOverlayPatch
                 MaxPowerLevel = maxPowerLevel,
                 HasFreshBattleState = true,
             };
-            entry.NextRefreshTime = now + UnityEngine.Random.Range(0.75f, 1.6f);
+            entry.NextRefreshTime = now + (float)(0.75 + rng.NextDouble() * 0.85);
         }
 
         state = entry.State;

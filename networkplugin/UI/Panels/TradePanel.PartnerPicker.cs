@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
@@ -613,19 +613,19 @@ public sealed partial class TradePanel
 
         if (hasSelfLoc && IsLocalDebugTradeAllowed())
         {
-            if (players.All(p => !string.Equals(p.PlayerId, "aidefault", StringComparison.Ordinal)))
+            if (players.All(p => !string.Equals(p.PlayerId, "aidefault", StringComparison.OrdinalIgnoreCase)))
             {
                 string loc = IsShopLikeLocation(selfLocName) ? selfLocName : "Trade";
                 players.Add(("aidefault", "AI Default", true, false, selfStage, selfX, selfY, loc, null));
             }
 
-            if (players.All(p => !string.Equals(p.PlayerId, "aidefault2", StringComparison.Ordinal)))
+            if (players.All(p => !string.Equals(p.PlayerId, "aidefault2", StringComparison.OrdinalIgnoreCase)))
             {
                 string loc = IsShopLikeLocation(selfLocName) ? selfLocName : "Trade";
                 players.Add(("aidefault2", "AI Default 2", true, false, selfStage, selfX, selfY, loc, null));
             }
 
-            if (players.All(p => !string.Equals(p.PlayerId, "aidefault3", StringComparison.Ordinal)))
+            if (players.All(p => !string.Equals(p.PlayerId, "aidefault3", StringComparison.OrdinalIgnoreCase)))
             {
                 string loc = IsShopLikeLocation(selfLocName) ? selfLocName : "Trade";
                 players.Add(("aidefault3", "AI Default 3", true, false, selfStage, selfX, selfY, loc, null));
@@ -634,7 +634,7 @@ public sealed partial class TradePanel
 
             List<(string PlayerId, string PlayerName, bool IsConnected, bool IsHost, int Stage, int LocationX, int LocationY, string LocationName, string CharacterId)> connectedOthers = players
                 .Where(p => !string.IsNullOrWhiteSpace(p.PlayerId))
-                .Where(p => !string.Equals(p.PlayerId, selfId, StringComparison.Ordinal))
+                .Where(p => !string.Equals(p.PlayerId, selfId, StringComparison.OrdinalIgnoreCase))
                 .Where(p => p.IsConnected)
                 .ToList();
 

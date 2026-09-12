@@ -538,6 +538,10 @@ public static partial class RemoteCardUsePatch
                                 DamageType = info.DamageType.ToString(),
                                 IsAccuracy = info.IsAccuracy,
                                 DontBreakPerfect = info.DontBreakPerfect,
+                                DamageBlocked = info.DamageBlocked,
+                                DamageShielded = info.DamageShielded,
+                                IsGrazed = info.IsGrazed,
+                                IsCanceled = da.IsCanceled,
                                 GunName = da.GunName,
                                 GunType = da.GunType.ToString(),
                             });

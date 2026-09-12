@@ -48,8 +48,20 @@ public static class CardActionCapturePatch
 
     private static string ResolveSelfPlayerName()
     {
-        string selfId = NetworkIdentityTracker.GetSelfPlayerId();
-        return OtherPlayersOverlayPatch.ResolveDisplayName(selfId, null, isLocal: true) ?? "Player";
+        try
+        {
+            string selfId = NetworkIdentityTracker.GetSelfPlayerId();
+            string name = OtherPlayersOverlayPatch.ResolveDisplayName(selfId, null, isLocal: true);
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                return name;
+            }
+            return selfId ?? "Player";
+        }
+        catch
+        {
+            return NetworkIdentityTracker.GetSelfPlayerId() ?? "Player";
+        }
     }
 
     #region Card.GetActions 拦截与动作收集
@@ -90,18 +102,9 @@ public static class CardActionCapturePatch
 
             string cardId = __instance.Id;
             string cardName = __instance.Name;
+            string playId = Guid.NewGuid().ToString("N");
 
-            var actionList = new List<BattleAction>();
-            foreach (var act in __result)
-            {
-                if (act != null)
-                {
-                    actionList.Add(act);
-                }
-            }
-
-            SendCapturedActionsBroadcast(cardId, cardName, isUs: false, selector, actionList);
-            __result = actionList;
+            __result = WrapActionsStream(__result, cardId, cardName, isUs: false, selector, playId);
         }
         catch (Exception ex)
         {
@@ -140,18 +143,9 @@ public static class CardActionCapturePatch
 
             string usId = __instance?.Id ?? "UnknownUs";
             string usName = __instance?.Name ?? __instance?.DebugName ?? "符卡";
+            string playId = Guid.NewGuid().ToString("N");
 
-            var actionList = new List<BattleAction>();
-            foreach (var act in __result)
-            {
-                if (act != null)
-                {
-                    actionList.Add(act);
-                }
-            }
-
-            SendCapturedActionsBroadcast(usId, usName, isUs: true, selector, actionList);
-            __result = actionList;
+            __result = WrapActionsStream(__result, usId, usName, isUs: true, selector, playId);
         }
         catch (Exception ex)
         {
@@ -161,14 +155,66 @@ public static class CardActionCapturePatch
 
     #endregion
 
-    #region 动作蓝图广播
+    #region 动作蓝图按序流式发送
 
-    private static void SendCapturedActionsBroadcast(
+    internal static IEnumerable<BattleAction> WrapActionsStream(
+        IEnumerable<BattleAction> source,
         string cardOrUsId,
         string cardOrUsName,
         bool isUs,
         UnitSelector selector,
-        List<BattleAction> actions)
+        string playId)
+    {
+        if (source == null)
+        {
+            yield break;
+        }
+
+        using IEnumerator<BattleAction> enumerator = source.GetEnumerator();
+        int actionIndex = 0;
+
+        while (true)
+        {
+            BattleAction current;
+            try
+            {
+                if (!enumerator.MoveNext())
+                {
+                    break;
+                }
+                current = enumerator.Current;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Logger?.LogError($"[CardActionCapture] 获取下一个动作异常 ({cardOrUsName}): {ex.Message}");
+                throw;
+            }
+
+            if (current != null)
+            {
+                try
+                {
+                    SendCapturedSingleAction(cardOrUsId, cardOrUsName, isUs, selector, current, playId, actionIndex);
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Logger?.LogError($"[CardActionCapture] 动作序列化或上报失败 (PlayId={playId}, Index={actionIndex}): {ex.Message}");
+                }
+                actionIndex++;
+            }
+
+            yield return current;
+        }
+    }
+
+    internal static void SendCapturedSingleAction(
+        string cardOrUsId,
+        string cardOrUsName,
+        bool isUs,
+        UnitSelector selector,
+        BattleAction action,
+        string playId,
+        int actionIndex)
     {
         try
         {
@@ -178,14 +224,24 @@ public static class CardActionCapturePatch
             }
 
             object[] actionBlueprint = Array.Empty<object>();
-            if (actions != null && actions.Count > 0)
+            if (action != null)
             {
-                actionBlueprint = RemoteCardUsePatch.BuildActionBlueprint(actions);
+                actionBlueprint = RemoteCardUsePatch.BuildActionBlueprint(new[] { action });
             }
 
-            string eventType = isUs
-                ? NetworkMessageTypes.BattlePlayerUsUsedBroadcast
-                : NetworkMessageTypes.BattlePlayerCardUsedBroadcast;
+            string eventType;
+            if (isHost)
+            {
+                eventType = isUs
+                    ? NetworkMessageTypes.BattlePlayerUsUsedBroadcast
+                    : NetworkMessageTypes.BattlePlayerCardUsedBroadcast;
+            }
+            else
+            {
+                eventType = isUs
+                    ? NetworkMessageTypes.BattlePlayerUsUsedReport
+                    : NetworkMessageTypes.BattlePlayerCardUsedReport;
+            }
 
             var payload = new
             {
@@ -193,6 +249,8 @@ public static class CardActionCapturePatch
                 PlayerId = selfPlayerId,
                 PlayerName = ResolveSelfPlayerName(),
                 IsHost = isHost,
+                PlayId = playId,
+                ActionIndex = actionIndex,
                 CardName = cardOrUsName,
                 CardId = cardOrUsId,
                 UsName = isUs ? cardOrUsName : null,
@@ -201,13 +259,33 @@ public static class CardActionCapturePatch
             };
 
             client.SendGameEventData(eventType, payload);
-            Plugin.Logger?.LogInfo($"[CardActionCapture] 已广播全特效出牌事件: {eventType} CardName={cardOrUsName}, ActionsCount={actionBlueprint.Length}");
+            Plugin.Logger?.LogInfo($"[CardActionCapture] 已发送出牌动作事件: {eventType} PlayId={playId}, Index={actionIndex}, CardName={cardOrUsName}, ActionCount={actionBlueprint.Length}");
         }
         catch (Exception ex)
         {
-            Plugin.Logger?.LogError($"[CardActionCapture] SendCapturedActionsBroadcast error: {ex.Message}");
+            Plugin.Logger?.LogError($"[CardActionCapture] SendCapturedSingleAction error: {ex.Message}");
+            throw;
         }
     }
+
+    internal static IEnumerable<BattleAction> WrapActionsStreamForTest(
+        IEnumerable<BattleAction> source,
+        string cardOrUsId,
+        string cardOrUsName,
+        bool isUs,
+        UnitSelector selector,
+        string playId)
+        => WrapActionsStream(source, cardOrUsId, cardOrUsName, isUs, selector, playId);
+
+    internal static void SendCapturedSingleActionForTest(
+        string cardOrUsId,
+        string cardOrUsName,
+        bool isUs,
+        UnitSelector selector,
+        BattleAction action,
+        string playId,
+        int actionIndex)
+        => SendCapturedSingleAction(cardOrUsId, cardOrUsName, isUs, selector, action, playId, actionIndex);
 
     #endregion
 }

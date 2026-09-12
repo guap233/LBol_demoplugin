@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
@@ -18,7 +18,10 @@ public static class NetworkIdentityTracker
 
     private static string _selfPlayerId;
     private static bool _selfIsHost;
+    private static string _sessionNonce;
     private static readonly HashSet<string> _playerIds = new(StringComparer.Ordinal);
+    private static bool _hasOnlineHost;
+    private static bool _isHostInGracePeriod;
 
     private static readonly Action<string, object> OnGameEventReceivedHandler = OnGameEventReceived;
     private static readonly Action<bool> OnConnectionStateChangedHandler = OnConnectionStateChanged;
@@ -49,9 +52,9 @@ public static class NetworkIdentityTracker
                 _subscribedClient.OnConnectionStateChanged -= OnConnectionStateChangedHandler;
             }
         }
-        catch
+        catch (Exception ex)
         {
-
+            Plugin.Logger?.LogDebug($"[NetworkIdentityTracker] Unsubscribe failed: {ex.Message}");
         }
 
         try
@@ -64,8 +67,9 @@ public static class NetworkIdentityTracker
                 _subscribed = true;
             }
         }
-        catch
+        catch (Exception ex)
         {
+            Plugin.Logger?.LogWarning($"[NetworkIdentityTracker] Subscribe failed: {ex.Message}");
             lock (SyncLock)
             {
                 _subscribedClient = null;
@@ -87,6 +91,30 @@ public static class NetworkIdentityTracker
         lock (SyncLock)
         {
             return _selfIsHost;
+        }
+    }
+
+    public static bool HasOnlineHost()
+    {
+        lock (SyncLock)
+        {
+            return _hasOnlineHost || _selfIsHost;
+        }
+    }
+
+    public static bool IsHostInGracePeriod()
+    {
+        lock (SyncLock)
+        {
+            return _isHostInGracePeriod && !_selfIsHost && !_hasOnlineHost;
+        }
+    }
+
+    public static string GetSessionNonce()
+    {
+        lock (SyncLock)
+        {
+            return _sessionNonce;
         }
     }
 
@@ -114,8 +142,16 @@ public static class NetworkIdentityTracker
         {
             _selfPlayerId = null;
             _selfIsHost = false;
+            _sessionNonce = null;
             _playerIds.Clear();
+            _hasOnlineHost = false;
+            _isHostInGracePeriod = false;
         }
+    }
+
+    internal static void ResetForTest()
+    {
+        OnConnectionStateChanged(false);
     }
 
     private static void OnGameEventReceived(string eventType, object payload)
@@ -142,15 +178,19 @@ public static class NetworkIdentityTracker
             case NetworkMessageTypes.PlayerLeft:
                 HandlePlayerLeft(root);
                 return;
+            case NetworkMessageTypes.Reconnect_RESPONSE:
+                HandleReconnectResponse(root);
+                return;
         }
     }
 
-    private static void HandleWelcome(JsonElement root)
+    internal static void HandleWelcome(JsonElement root)
     {
         try
         {
             string playerId = GetString(root, "PlayerId");
             bool isHost = GetBool(root, "IsHost");
+            string sessionNonce = GetString(root, "SessionNonce");
 
             JsonElement listElem;
             bool hasList = root.TryGetProperty("Players", out listElem) && listElem.ValueKind == JsonValueKind.Array;
@@ -163,23 +203,40 @@ public static class NetworkIdentityTracker
             {
                 _selfPlayerId = playerId;
                 _selfIsHost = isHost;
+                _sessionNonce = sessionNonce;
                 _playerIds.Clear();
+                bool onlineHostFound = isHost;
+                bool graceHostFound = false;
+
                 if (hasList)
                 {
                     foreach (JsonElement p in listElem.EnumerateArray())
                     {
                         string id = GetString(p, "PlayerId");
-                        if (!string.IsNullOrWhiteSpace(id))
+                        bool hasConnectedField = p.ValueKind == JsonValueKind.Object && p.TryGetProperty("IsConnected", out _);
+                        bool isConnected = !hasConnectedField || GetBool(p, "IsConnected");
+                        bool pHost = GetBool(p, "IsHost");
+
+                        if (isConnected && !string.IsNullOrWhiteSpace(id))
                         {
                             _playerIds.Add(id);
                         }
+
+                        if (pHost)
+                        {
+                            if (isConnected) onlineHostFound = true;
+                            else graceHostFound = true;
+                        }
                     }
                 }
+
+                _hasOnlineHost = onlineHostFound;
+                _isHostInGracePeriod = graceHostFound && !onlineHostFound;
             }
         }
-        catch
+        catch (Exception ex)
         {
-
+            Plugin.Logger?.LogWarning($"[NetworkIdentityTracker] HandleWelcome error: {ex.Message}");
         }
     }
 
@@ -196,6 +253,8 @@ public static class NetworkIdentityTracker
             lock (SyncLock)
             {
                 _selfIsHost = string.Equals(_selfPlayerId, newHostId, StringComparison.Ordinal);
+                _hasOnlineHost = true;
+                _isHostInGracePeriod = false;
             }
         }
         catch
@@ -204,7 +263,7 @@ public static class NetworkIdentityTracker
         }
     }
 
-    private static void HandlePlayerListUpdate(JsonElement root)
+    internal static void HandlePlayerListUpdate(JsonElement root)
     {
         if (!root.TryGetProperty("Players", out JsonElement playersElem) || playersElem.ValueKind != JsonValueKind.Array)
         {
@@ -215,11 +274,18 @@ public static class NetworkIdentityTracker
         {
             _playerIds.Clear();
             bool foundSelf = false;
-            bool selfIsHost = false;
+            bool selfIsHost = _selfIsHost;
+            bool onlineHostFound = _selfIsHost;
+            bool graceHostFound = false;
+
             foreach (JsonElement p in playersElem.EnumerateArray())
             {
                 string id = GetString(p, "PlayerId");
-                if (!string.IsNullOrWhiteSpace(id))
+                bool hasConnectedField = p.ValueKind == JsonValueKind.Object && p.TryGetProperty("IsConnected", out _);
+                bool isConnected = !hasConnectedField || GetBool(p, "IsConnected");
+                bool pHost = GetBool(p, "IsHost");
+
+                if (isConnected && !string.IsNullOrWhiteSpace(id))
                 {
                     _playerIds.Add(id);
                 }
@@ -228,14 +294,24 @@ public static class NetworkIdentityTracker
                     string.Equals(id, _selfPlayerId, StringComparison.Ordinal))
                 {
                     foundSelf = true;
-                    selfIsHost = GetBool(p, "IsHost");
+                    selfIsHost = pHost;
+                }
+
+                if (pHost)
+                {
+                    if (isConnected) onlineHostFound = true;
+                    else graceHostFound = true;
                 }
             }
 
             if (foundSelf)
             {
                 _selfIsHost = selfIsHost;
+                if (selfIsHost) onlineHostFound = true;
             }
+
+            _hasOnlineHost = onlineHostFound;
+            _isHostInGracePeriod = graceHostFound && !onlineHostFound;
         }
     }
 
@@ -247,9 +323,16 @@ public static class NetworkIdentityTracker
             return;
         }
 
+        bool isHost = GetBool(root, "IsHost");
+
         lock (SyncLock)
         {
             _playerIds.Add(id);
+            if (isHost)
+            {
+                _hasOnlineHost = true;
+                _isHostInGracePeriod = false;
+            }
         }
     }
 
@@ -267,31 +350,43 @@ public static class NetworkIdentityTracker
         }
     }
 
-    private static bool TryGetJsonElement(object payload, out JsonElement root)
+    public static void HandleReconnectResponse(JsonElement root)
     {
         try
         {
-            if (payload is JsonElement je)
+            if (root.TryGetProperty("Success", out var sElem) && sElem.GetBoolean())
             {
-                root = je;
-                return true;
-            }
+                string playerId = GetString(root, "PlayerId");
+                bool isHost = GetBool(root, "IsHost");
+                string sessionNonce = GetString(root, "SessionNonce");
 
-            if (payload is string s)
-            {
-                using JsonDocument doc = JsonDocument.Parse(s);
-                root = doc.RootElement.Clone();
-                return true;
+                lock (SyncLock)
+                {
+                    if (!string.IsNullOrWhiteSpace(playerId))
+                    {
+                        _selfPlayerId = playerId;
+                        _playerIds.Add(playerId);
+                    }
+                    _selfIsHost = isHost;
+                    if (isHost)
+                    {
+                        _hasOnlineHost = true;
+                    }
+                    if (!string.IsNullOrWhiteSpace(sessionNonce))
+                    {
+                        _sessionNonce = sessionNonce;
+                    }
+                }
             }
         }
-        catch
+        catch (Exception ex)
         {
-
+            Plugin.Logger?.LogWarning($"[NetworkIdentityTracker] HandleReconnectResponse error: {ex.Message}");
         }
-
-        root = default;
-        return false;
     }
+
+    private static bool TryGetJsonElement(object payload, out JsonElement root)
+        => NetworkEventHelper.TryGetJsonElement(payload, out root);
 
     private static string GetString(JsonElement elem, string property)
     {

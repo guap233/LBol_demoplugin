@@ -319,6 +319,12 @@ public static partial class OtherPlayersOverlayPatch
         root.SetActive(false);
     }
 
+    private static bool HasOngoingBattleData(PlayerSummary p)
+    {
+        if (p == null || string.IsNullOrWhiteSpace(p.PlayerId)) return false;
+        return TryGetLatestRemoteBattleSnapshot(p.PlayerId) != null;
+    }
+
     private static void RefreshUi()
     {
         EnsureVirtualAiDefaultPlayer_NoThrow();
@@ -329,6 +335,7 @@ public static partial class OtherPlayersOverlayPatch
             list = _players.Values
                 .Where(p => p != null && !string.IsNullOrWhiteSpace(p.PlayerId))
                 .Where(p => string.IsNullOrWhiteSpace(_selfPlayerId) || !string.Equals(p.PlayerId, _selfPlayerId, StringComparison.Ordinal))
+                .Where(p => p.IsConnected || HasOngoingBattleData(p))
                 .OrderByDescending(p => p.IsHost)
                 .ThenByDescending(p => p.IsConnected)
                 .ThenBy(p => p.PlayerName, StringComparer.OrdinalIgnoreCase)
@@ -1117,7 +1124,7 @@ public static partial class OtherPlayersOverlayPatch
             entry.HealthGroup.alpha = 1f;
         }
 
-        if (hasBattleState)
+        if (hasBattleState && battleState.MaxHealth > 0)
         {
             ApplyPowerCharge(entry, battleState, isConnected);
             ApplyHealthBar(entry, battleState);
@@ -1614,8 +1621,8 @@ public static partial class OtherPlayersOverlayPatch
 
         if (TryGetRemoteBattleState(summary, out RemoteBattleState battleState))
         {
-            var parts = new List<string> { "在线", $"{Mathf.Max(0, battleState.Health)}/{Mathf.Max(1, battleState.MaxHealth)}" };
-            int defense = Mathf.Max(0, battleState.Block) + Mathf.Max(0, battleState.Shield);
+            var parts = new List<string> { "在线", $"{Math.Max(0, battleState.Health)}/{Math.Max(1, battleState.MaxHealth)}" };
+            int defense = Math.Max(0, battleState.Block) + Math.Max(0, battleState.Shield);
             if (defense > 0)
             {
                 parts.Add($"盾{defense}");
@@ -1623,7 +1630,7 @@ public static partial class OtherPlayersOverlayPatch
 
             if (battleState.PowerPerLevel > 0)
             {
-                parts.Add($"符{Mathf.Max(0, battleState.CurrentPower)}");
+                parts.Add($"符{Math.Max(0, battleState.CurrentPower)}");
             }
 
             return string.Join(" · ", parts);
@@ -1632,7 +1639,7 @@ public static partial class OtherPlayersOverlayPatch
         INetworkPlayer player = TryGetNetworkManager()?.GetPlayer(playerId);
         if (player == null)
         {
-            return "在线";
+            return "同步中";
         }
 
         try
@@ -1641,10 +1648,10 @@ public static partial class OtherPlayersOverlayPatch
 
             if (player.maxHP > 0)
             {
-                parts.Add($"{Mathf.Max(0, player.HP)}/{player.maxHP}");
+                parts.Add($"{Math.Max(0, player.HP)}/{player.maxHP}");
             }
 
-            int defense = Mathf.Max(0, player.block) + Mathf.Max(0, player.shield);
+            int defense = Math.Max(0, player.block) + Math.Max(0, player.shield);
             if (defense > 0)
             {
                 parts.Add($"盾{defense}");
@@ -1655,11 +1662,16 @@ public static partial class OtherPlayersOverlayPatch
                 parts.Add("已结束");
             }
 
+            if (parts.Count == 1)
+            {
+                return "同步中";
+            }
+
             return string.Join(" · ", parts);
         }
         catch
         {
-            return "在线";
+            return "同步中";
         }
     }
 
@@ -2020,7 +2032,24 @@ public static partial class OtherPlayersOverlayPatch
 
     #region 数据模型
 
-        private sealed class PlayerSummary
+    internal static bool TryGetRemoteBattleStateForTest(PlayerSummary playerSummary, out RemoteBattleState state)
+    {
+        if (playerSummary != null)
+        {
+            lock (_syncLock)
+            {
+                _players[playerSummary.PlayerId] = playerSummary;
+            }
+        }
+        return TryGetRemoteBattleState(playerSummary, out state);
+    }
+
+    internal static string BuildStatusTextForTest(string playerId, bool isConnected)
+    {
+        return BuildStatusText(playerId, isConnected);
+    }
+
+    internal sealed class PlayerSummary
     {
                 public string PlayerId { get; set; }
 

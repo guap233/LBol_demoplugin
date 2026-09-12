@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using HarmonyLib;
 using LBoL.Base;
@@ -17,6 +17,7 @@ using NetworkPlugin.Patch.Network;
 
 namespace NetworkPlugin.Patch.Actions;
 
+[HarmonyPatch]
 public class DamageAction_Patch
 {
     #region 依赖注入
@@ -123,71 +124,7 @@ public class DamageAction_Patch
         }
     }
 
-        [HarmonyPatch(typeof(DamageAction), MethodType.Constructor, typeof(Unit), typeof(Unit), typeof(DamageInfo), typeof(string), typeof(GunType))]
-    [HarmonyPostfix]
-    public static void SingleTargetConstructor_Postfix(DamageAction __instance, Unit source, Unit unit, DamageInfo damageInfo, string gunName, GunType gunType)
-    {
-        try
-        {
-
-            if (RemoteCardUsePatch.IsInRemoteCardPipeline)
-            {
-                return;
-            }
-
-            if (!TryGetSyncContext(out ISynchronizationManager syncManager, out INetworkPlayer player))
-            {
-                return;
-            }
-
-            if (source is EnemyUnit enemy && unit is PlayerUnit localPlayer)
-            {
-                TryBroadcastEnemyAttackVisual(syncManager, player, enemy, localPlayer, damageInfo, gunName, gunType);
-                return;
-            }
-
-            if (source is not PlayerUnit)
-            {
-                return;
-            }
-
-            Dictionary<string, object> damageData = new()
-            {
-                ["UserName"] = player.userName,
-                ["Timestamp"] = DateTime.Now.Ticks,
-                ["ActionType"] = "Damage",
-                ["GunName"] = gunName,
-                ["GunType"] = gunType.ToString(),
-                ["Damage"] = damageInfo.Amount,
-                ["DamageAmount"] = damageInfo.Amount,
-                ["DamageType"] = damageInfo.DamageType.ToString(),
-                ["DamageShielded"] = damageInfo.DamageShielded,
-                ["DamageBlocked"] = damageInfo.DamageBlocked,
-                ["ZeroDamage"] = damageInfo.ZeroDamage,
-                ["DontBreakPerfect"] = damageInfo.DontBreakPerfect,
-                ["IsAccuracy"] = damageInfo.IsAccuracy,
-                ["IsGrazed"] = damageInfo.IsGrazed,
-                ["SourceId"] = source.Id,
-                ["SourceName"] = source.Name,
-                ["TargetCount"] = 1,
-            };
-
-            GameEvent gameEvent = GameEventManager.CreateEvent(
-                NetworkMessageTypes.OnDamageDealt.ToString(),
-                player.userName,
-                damageData
-            );
-
-            syncManager.SendGameEvent(gameEvent);
-
-            Plugin.Logger?.LogInfo($"[DamageSync] 伤害动作: {source.Name} -> {unit.Name} (伤害: {damageInfo.Amount}, 武器: {gunName})");
-        }
-        catch (Exception ex)
-        {
-            Plugin.Logger?.LogError($"[DamageSync] SingleTargetConstructor_Postfix 错误: {ex.Message}");
-        }
-    }
-
+    
         private static void TryBroadcastEnemyAttackVisual(
         ISynchronizationManager syncManager,
         INetworkPlayer player,
